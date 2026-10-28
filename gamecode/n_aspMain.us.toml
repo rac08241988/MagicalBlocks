@@ -1,0 +1,20 @@
+# RSPRecomp config for the n_aspMain (n_audio) RSP microcode in Magical Tetris Challenge (USA, NMTE)
+# ROM SHA1 ca3fbd17406031a88e04bb79959d851550b641d0
+# n_aspMain text is at ROM 0x6E170 (size 0xC60) and is loaded at IMEM 0x1080; rspboot (ROM 0x6E0A0, 0xD0 bytes)
+# runs at IMEM 0x1000 and is not part of this microcode, so text_address is 0x04001080 (verified: jal targets
+# 0x1120/0x114C/0x1174 and every dispatch-table entry land on routine starts with this base).
+# Task data (OSTask.ucode_data) = n_aspMainDataStart 0x800A82B0 (ROM 0xA8EB0), ucode_data_size 0x800;
+# the runtime DMAs it into DMEM, RSPRecomp only needs the text.
+text_offset = 0x6E170
+text_size = 0xC60
+text_address = 0x04001080
+# Shipped with the app (gamecode/); the app fills in both paths (the player's own ROM, its build folder).
+rom_file_path = "rom.z64"
+output_file_path = "rsp/n_aspMain.cpp"
+output_function_name = "n_aspMain"
+# Audio command dispatch table = first 16 halfwords of the ucode data (DMEM 0x000).
+# Entries 0x0000 (x2) and 0x02B0 are unused/no-op slots and are not valid IMEM targets.
+extra_indirect_branch_targets = [
+    0x10EC, 0x139C, 0x119C, 0x1A64, 0x11C8, 0x17EC, 0x1208,
+    0x127C, 0x1348, 0x1248, 0x1C84, 0x12D4, 0x1384,
+]

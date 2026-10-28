@@ -1,0 +1,42 @@
+# N64Recomp config for Magical Tetris Challenge (USA, NMTE)
+# ROM SHA1 ca3fbd17406031a88e04bb79959d851550b641d0
+[input]
+entrypoint = 0x80000400
+# Paths are relative to this file (app/recomp-config/). The ELF is built from the user's ROM by
+# ../../disasm (splat + binutils); see tools/generate_code.sh.
+elf_path = "../../disasm/build/magicaltetris.elf"
+output_func_path = "../RecompiledFuncs-trace"
+trace_mode = true
+# Single static code section, no overlays -> no relocatable_sections_path needed.
+
+[patches]
+# The game's boot function is literally named "main" (symbol from the libultra boot convention);
+# rename it so it does not clash with the C/C++ program entry point.
+renamed = ["main"]
+# rspbootTextStart is already in N64Recomp's built-in ignore list.
+# RSP microcode blobs that live in the CPU .text section; they are data for the RSP, not MIPS CPU code.
+ignored = [
+    # libultra-internal static helpers whose public callers are reimplemented by ultramodern/librecomp:
+    # viMgrMain (vimgr.c) and the Pfs page helper in contpfs.c. Recompiling them would reference
+    # libultra internals (__osViSwapContext, __osContRamRead, ...) that the runtime does not provide.
+    "vimgr_text_01A0",
+    "contpfs_text_0078",
+    "n_aspMainTextStart",
+    "__gspF3DEX_fifo_textbin",
+    "__gspF3DLX_fifo_textbin",
+    "__gspF3DLX_Rej_fifo_textbin",
+    "__gspF3DLP_Rej_fifo_textbin",
+    "__gspL3DEX_fifo_textbin",
+    "__gspLine3D_fifo_textbin",
+    "__gspFast3D_fifo_textbin",
+    "__gspS2DEX_fifo_textbin",
+    "__gspS2DEX_fifo_d_textbin",
+    "capcom_TlbReadEntry",
+    "capcom_TlbWriteEntry",
+    "capcom_TlbUnmapAll",
+    "capcom_TlbMap",
+]
+# Capcom hand-written TLB helpers (tlbr/tlbwi + cop0 Index/EntryHi/EntryLo/PageMask).
+# Dead code in this ROM (no callers outside each other, no function pointers). N64Recomp cannot emit
+# cop0 TLB ops, so they are ignored here and re-implemented natively (logged shadow TLB) in
+# app/src/game/tlb.cpp.

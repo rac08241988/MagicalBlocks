@@ -1,0 +1,950 @@
+From 5a3420244422cd1757ca71eeff6014cabf4e3142 Mon Sep 17 00:00:00 2001
+From: n64recomp-cross <n64recomp-cross@localhost>
+Date: Sun, 18 Oct 2026 01:28:23 -0400
+Subject: [PATCH] S2DEX: implement object commands (OBJ_RECTANGLE/_R,
+ OBJ_SPRITE, OBJ_MOVEMEM, SELECT_DL, GENSTAT, LDTX_*) and BG divide-by-zero
+ guards
+
+Clean-room implementation from the public N64 SDK S2DEX documentation and
+gs2dex.h structure definitions. Pure math lives in src/gbi/rt64_s2dex_obj.*
+so it can be unit tested offline.
+---
+ CMakeLists.txt              |   1 +
+ src/gbi/rt64_gbi_s2dex.cpp  | 159 ++++++++++++++---
+ src/gbi/rt64_gbi_s2dex.h    |  15 +-
+ src/gbi/rt64_gbi_s2dex2.cpp |  27 +--
+ src/gbi/rt64_gbi_s2dex2.h   |   4 +
+ src/gbi/rt64_s2dex_obj.cpp  | 337 ++++++++++++++++++++++++++++++++++++
+ src/gbi/rt64_s2dex_obj.h    | 147 ++++++++++++++++
+ src/hle/rt64_rsp.h          |   5 +
+ 8 files changed, 661 insertions(+), 34 deletions(-)
+ create mode 100644 src/gbi/rt64_s2dex_obj.cpp
+ create mode 100644 src/gbi/rt64_s2dex_obj.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4ec853c..18f2929 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -333,6 +333,7 @@ set (SOURCES
+     "${PROJECT_SOURCE_DIR}/src/gbi/rt64_gbi_rdp.cpp"
+     "${PROJECT_SOURCE_DIR}/src/gbi/rt64_gbi_s2dex.cpp"
+     "${PROJECT_SOURCE_DIR}/src/gbi/rt64_gbi_s2dex2.cpp"
++    "${PROJECT_SOURCE_DIR}/src/gbi/rt64_s2dex_obj.cpp"
+     "${PROJECT_SOURCE_DIR}/src/gbi/rt64_gbi_extended.cpp"
+ 
+     "${PROJECT_SOURCE_DIR}/src/gui/rt64_camera_controller.cpp"
+diff --git a/src/gbi/rt64_gbi_s2dex.cpp b/src/gbi/rt64_gbi_s2dex.cpp
+index 4b41bfa..896334a 100644
+--- a/src/gbi/rt64_gbi_s2dex.cpp
++++ b/src/gbi/rt64_gbi_s2dex.cpp
+@@ -10,6 +10,7 @@
+ #include "rt64_gbi_f3d.h"
+ #include "rt64_gbi_f3dex.h"
+ #include "rt64_gbi_rdp.h"
++#include "rt64_s2dex_obj.h"
+ 
+ //#define LOG_BGRECT_METHODS
+ //#define LOG_LOADTXTR_METHODS
+@@ -23,7 +24,8 @@ namespace RT64 {
+         void moveWord(State *state, DisplayList **dl) {
+             switch ((*dl)->p0(0, 8)) {
+             case G_MW_GENSTAT:
+-                assert(false);
++                // gSPSetStatus(sid, value): offset field holds the sid byte offset.
++                setStatus(state, (*dl)->p0(8, 16), (*dl)->w1);
+                 break;
+             default:
+                 GBI_F3D::moveWord(state, dl);
+@@ -32,15 +34,38 @@ namespace RT64 {
+         }
+ 
+         void rdpHalf0(State *state, DisplayList **dl) {
++            // The microcode just latches this command's words. G_SELECT_DL (gsSPSelectDL /
++            // gsSPSelectBranchDL) consumes them as the low address half, sid and flag.
++            state->rsp->S2D.selectDlHalf0W0 = (*dl)->w0;
++            state->rsp->S2D.selectDlHalf0W1 = (*dl)->w1;
++
+             uint8_t nextCode = (*dl + 1)->w0 >> 24;
+-            if (nextCode == S2DEX_G_SELECT_DL) {
+-                assert(false);
+-            }
+-            else if (nextCode == F3D_G_RDPHALF_1) {
++            if (nextCode == F3D_G_RDPHALF_1) {
+                 GBI_RDP::texrect(state, dl);
+             }
+         }
+ 
++        void setStatus(State *state, uint32_t sid, uint32_t value) {
++            state->rsp->S2D.statuses[S2DEXObj::statusIndex(sid)] = value;
++        }
++
++        void selectDl(State *state, DisplayList **dl) {
++            // RDPHALF_0: w0 = cmd | sid << 16 | (addr & 0xFFFF), w1 = flag
++            // SELECT_DL: w0 = cmd | push << 16 | (addr >> 16),   w1 = mask
++            RSP *rsp = state->rsp.get();
++            const S2DEXObj::SelectDlCommand c = S2DEXObj::decodeSelectDl(rsp->S2D.selectDlHalf0W0, rsp->S2D.selectDlHalf0W1, (*dl)->w0, (*dl)->w1);
++            if (!S2DEXObj::selectDl(rsp->S2D.statuses, c.sid, c.flag, c.mask)) {
++                return;
++            }
++
++            if (c.push) {
++                state->pushReturnAddress(*dl);
++            }
++
++            const uint32_t rdramAddress = rsp->fromSegmentedMasked(c.address);
++            *dl = reinterpret_cast<DisplayList *>(state->fromRDRAM(rdramAddress)) - 1;
++        }
++
+         void bg1CycTMEMLoadTile(RDP &rdp, const uObjScaleBg_t &scaleBg, uint32_t imagePtr, uint16_t imageSrcWsize, int16_t loadLines, int16_t tmemSH) {
+             // TODO: Does it make sense that when using 32-bit images, the lrt is 0?
+             const bool is32Bits = (scaleBg.imageSiz == G_IM_SIZ_32b);
+@@ -198,6 +223,12 @@ namespace RT64 {
+             int16_t frameRemain = frameH >> 2;
+             int16_t imageSrcW = scaleBg.imageW << 3;
+             int16_t imageSrcH = scaleBg.imageH << 3;
++
++            // Guard against degenerate images: the wrap loops below would never
++            // terminate and the slice math would divide by zero.
++            if ((imageSrcW <= 0) || (imageSrcH <= 0)) {
++                return;
++            }
+             
+             // Find the corresponding range in the image for the frame.
+             // The image size needs to be extended when using bilerp.
+@@ -255,7 +286,7 @@ namespace RT64 {
+             // We limit the amount of TMEM that can be used to half for CI images since the upper region
+             // needs to be used for the palette.
+             int16_t tmemSize = (scaleBg.imageFmt == G_IM_FMT_CI) ? 256 : 512;
+-            int16_t tmemShift = (0x200 >> scaleBg.imageSiz);
++            int16_t tmemShift = (0x200 >> (scaleBg.imageSiz & 0x3));
+             int16_t tmemMask = (tmemShift - 1);
+             int32_t imageSliceWmax;
+             if (scaleBg.imageSiz == G_IM_SIZ_32b) {
+@@ -269,9 +300,10 @@ namespace RT64 {
+ 
+             // Get the amount of lines that can be loaded into TMEM at once.
+             uint16_t tmemSliceWmax = (imageSliceWmax + tmemMask) / tmemShift + 1;
+-            int16_t tmemSliceLines = tmemSize / tmemSliceWmax;
+-            int16_t imageSliceLines = tmemSliceLines - usesBilerp;
+-            int32_t frameSliceLines = (imageSliceLines << 20) / scaleH;
++            // Divide-by-zero guard (see S2DEXObj::bgSliceLines): a slice wider than TMEM
++            // yields zero lines per slice, which would make frameSliceLines zero below.
++            int16_t imageSliceLines;
++            int32_t frameSliceLines = S2DEXObj::bgSliceLines(tmemSize, tmemSliceWmax, usesBilerp, scaleH, imageSliceLines);
+ 
+             // Figure out which line to start with from the image coordinates.
+             int32_t imageLYoffset = (int32_t(imageY0) - imageYorig) << 5;
+@@ -447,8 +479,16 @@ namespace RT64 {
+             }
+ 
+             const uint32_t Division = (bg.imageFmt == G_IM_FMT_CI) ? 2 : 1;
+-            const uint16_t bgRectCount = bg.imageH / (bg.tmemH / Division); // TODO: Check for remaining pixels for the last Texrect.
+-            bgRectLrt = (bg.tmemH / Division) - lrSubstract;
++            const uint16_t sliceH = uint16_t(bg.tmemH / Division);
++
++            // Divide-by-zero guard: a TMEM height below one line can't be drawn.
++            if (sliceH < lrSubstract) {
++                state->endSpriteCommand();
++                return;
++            }
++
++            const uint16_t bgRectCount = bg.imageH / sliceH; // TODO: Check for remaining pixels for the last Texrect.
++            bgRectLrt = sliceH - lrSubstract;
+             rdp->setTileSize(G_TX_RENDERTILE, 0, 0, bgRectLrs, bgRectLrt);
+ 
+             for (uint16_t r = 0; r < bgRectCount; r++) {
+@@ -494,12 +534,12 @@ namespace RT64 {
+             uint32_t mask = obj->mask;
+             uint32_t flag = obj->flag;
+             // Get the status for the given id.
+-            uint32_t status = state->rsp->S2D.statuses[sid / 4];
++            uint32_t status = state->rsp->S2D.statuses[S2DEXObj::statusIndex(sid)];
+ 
+             // Skip the load if the masked status is equal to the provided flag.
+             if ((status & mask) != flag) {
+                 // Update the status for the given id.
+-                state->rsp->S2D.statuses[sid / 4] = (status & ~mask) | (flag & mask);
++                state->rsp->S2D.statuses[S2DEXObj::statusIndex(sid)] = (status & ~mask) | (flag & mask);
+                 state->rsp->S2D.data_02AE = -127;
+ 
+                 if (r1 == -127) {
+@@ -546,6 +586,71 @@ namespace RT64 {
+             }
+         }
+ 
++        static void setupSpriteTile(State *state, const S2DEXObj::Sprite &sprite) {
++            const S2DEXObj::TileParams t = S2DEXObj::spriteTile(sprite, state->rsp->objRenderMode);
++            state->rdp->setTile(G_TX_RENDERTILE, t.fmt, t.siz, t.line, t.tmem, t.palette, t.cmt, t.cms, G_TX_NOMASK, G_TX_NOMASK, G_TX_NOLOD, G_TX_NOLOD);
++            state->rdp->setTileSize(G_TX_RENDERTILE, t.uls, t.ult, t.lrs, t.lrt);
++        }
++
++        static int16_t clampS16(int32_t v) {
++            return int16_t(std::clamp(v, int32_t(INT16_MIN), int32_t(INT16_MAX)));
++        }
++
++        static void doObjRectangle(State *state, const S2DEXObj::Sprite &sprite, bool useMatrix) {
++            RDP *rdp = state->rdp.get();
++            RSP *rsp = state->rsp.get();
++            setupSpriteTile(state, sprite);
++
++            const FixedRect &scissorRect = rdp->scissorRectStack[rdp->scissorStackSize - 1];
++            const S2DEXObj::Scissor scissor = { scissorRect.ulx, scissorRect.uly, scissorRect.lrx, scissorRect.lry };
++            const bool copyMode = (rdp->otherMode.cycleType() == G_CYC_COPY);
++            const S2DEXObj::Matrix matrix = S2DEXObj::decodeMatrix(rsp->S2D.objMtx);
++            const S2DEXObj::TexRect r = S2DEXObj::objRectangle(sprite, rsp->objRenderMode, copyMode, scissor, useMatrix ? &matrix : nullptr);
++            if (r.draw) {
++                rdp->drawTexRect(r.ulx, r.uly, r.lrx, r.lry, G_TX_RENDERTILE, clampS16(r.uls), clampS16(r.ult), clampS16(r.dsdx), clampS16(r.dtdy), false);
++            }
++        }
++
++        static void doObjSprite(State *state, const S2DEXObj::Sprite &sprite) {
++            RSP *rsp = state->rsp.get();
++            setupSpriteTile(state, sprite);
++
++            S2DEXObj::Quad quad;
++            const S2DEXObj::Matrix matrix = S2DEXObj::decodeMatrix(rsp->S2D.objMtx);
++            if (!S2DEXObj::objSprite(sprite, matrix, rsp->objRenderMode, quad)) {
++                return;
++            }
++
++            float pos[24];
++            float tc[12];
++            float col[24] = {};
++            S2DEXObj::quadToTriangles(quad, pos, tc);
++            state->rdp->drawTris(2, pos, tc, col, G_TX_RENDERTILE, 0);
++        }
++
++        static S2DEXObj::Sprite readSprite(State *state, uint32_t segmentedAddress) {
++            readS2DStruct(state, segmentedAddress, S2DEXObj::OBJ_SPRITE_SIZE);
++            return S2DEXObj::decodeSprite(state->rsp->S2D.struct_buffer.data(), 0);
++        }
++
++        void objRectangle(State *state, DisplayList **dl) {
++            doObjRectangle(state, readSprite(state, (*dl)->w1), false);
++        }
++
++        void objRectangleR(State *state, DisplayList **dl) {
++            doObjRectangle(state, readSprite(state, (*dl)->w1), true);
++        }
++
++        void objSprite(State *state, DisplayList **dl) {
++            doObjSprite(state, readSprite(state, (*dl)->w1));
++        }
++
++        void objMoveMem(State *state, DisplayList **dl) {
++            // gsSPObjMatrix: size 24 at offset 0. gsSPObjSubMatrix: size 8 at offset 16.
++            uint32_t rdramAddress = state->rsp->fromSegmentedMasked((*dl)->w1) & RSP_DMA_MASK;
++            S2DEXObj::moveMem(state->rsp->S2D.objMtx, state->fromRDRAM(rdramAddress), (*dl)->w0);
++        }
++
+         void objLoadTxtr(State *state, DisplayList **dl) {
+         #ifdef LOG_LOADTXTR_METHODS
+             RT64_LOG_PRINTF("objLoadTxtr::start(0x%08X)", (*dl)->w1);
+@@ -573,8 +678,7 @@ namespace RT64 {
+             doLoadTxtr(state, &obj->txtr);
+             
+             // Execute the sprite draw
+-            // TODO call doObjSprite(state, &obj->sprite) when it's implemented
+-            assert(false);
++            doObjSprite(state, S2DEXObj::decodeSprite(obj->sprite, 0));
+         #ifdef LOG_LOADTXTR_METHODS
+             RT64_LOG_PRINTF("objLoadTxSprite::end(0x%08X)", (*dl)->w1);
+         #endif
+@@ -592,8 +696,7 @@ namespace RT64 {
+             doLoadTxtr(state, &obj->txtr);
+             
+             // Execute the rect draw
+-            // TODO call doObjRectangle(state, &obj->sprite) when it's implemented
+-            assert(false);
++            doObjRectangle(state, S2DEXObj::decodeSprite(obj->sprite, 0), false);
+         #ifdef LOG_LOADTXTR_METHODS
+             RT64_LOG_PRINTF("objLoadTxRect::end(0x%08X)", (*dl)->w1);
+         #endif
+@@ -611,15 +714,25 @@ namespace RT64 {
+             doLoadTxtr(state, &obj->txtr);
+             
+             // Execute the rect r draw
+-            // TODO call doObjRectangleR(state, &obj->sprite) when it's implemented
+-            assert(false);
++            doObjRectangle(state, S2DEXObj::decodeSprite(obj->sprite, 0), true);
+         #ifdef LOG_LOADTXTR_METHODS
+             RT64_LOG_PRINTF("objLoadTxRectR::end(0x%08X)", (*dl)->w1);
+         #endif
+         }
+ 
++        void resetObjectState(State *state) {
++            RSP *rsp = state->rsp.get();
++            rsp->objRenderMode = 0x0;
++            rsp->S2D.struct_buffer.fill(0);
++            rsp->S2D.statuses.fill(0);
++            rsp->S2D.data_02AE = -128;
++            S2DEXObj::resetMatrix(rsp->S2D.objMtx);
++            rsp->S2D.selectDlHalf0W0 = 0;
++            rsp->S2D.selectDlHalf0W1 = 0;
++        }
++
+         void reset(State *state) {
+-            state->rsp->objRenderMode = 0x0;
++            resetObjectState(state);
+         }
+ 
+         void setup(GBI *gbi) {
+@@ -645,6 +758,11 @@ namespace RT64 {
+             gbi->map[S2DEX_G_OBJ_LDTX_SPRITE] = &objLoadTxSprite;
+             gbi->map[S2DEX_G_OBJ_LDTX_RECT] = &objLoadTxRect;
+             gbi->map[S2DEX_G_OBJ_LDTX_RECT_R] = &objLoadTxRectR;
++            gbi->map[S2DEX_G_OBJ_RECTANGLE] = &objRectangle;
++            gbi->map[S2DEX_G_OBJ_RECTANGLE_R] = &objRectangleR;
++            gbi->map[S2DEX_G_OBJ_SPRITE] = &objSprite;
++            gbi->map[S2DEX_G_OBJ_MOVEMEM] = &objMoveMem;
++            gbi->map[S2DEX_G_SELECT_DL] = &selectDl;
+             gbi->map[F3D_G_DL] = &GBI_F3D::runDl;
+             gbi->map[F3D_G_ENDDL] = &GBI_F3D::endDl;
+             gbi->map[F3D_G_MOVEWORD] = &moveWord;
+@@ -659,6 +777,7 @@ namespace RT64 {
+             gbi->map[G_SETTIMG] = &GBI_F3D::setTextureImage;
+ 
+             gbi->resetFromTask = &reset;
++            gbi->resetFromLoad = &reset;
+         }
+     }
+ };
+\ No newline at end of file
+diff --git a/src/gbi/rt64_gbi_s2dex.h b/src/gbi/rt64_gbi_s2dex.h
+index 8de11eb..eb8aab5 100644
+--- a/src/gbi/rt64_gbi_s2dex.h
++++ b/src/gbi/rt64_gbi_s2dex.h
+@@ -8,6 +8,9 @@
+ 
+ #define S2DEX_G_BG_1CYC 0x01
+ #define S2DEX_G_BG_COPY 0x02
++#define S2DEX_G_OBJ_RECTANGLE 0x03
++#define S2DEX_G_OBJ_SPRITE 0x04
++#define S2DEX_G_OBJ_MOVEMEM 0x05
+ #define S2DEX_G_RDPHALF_0 0xE4
+ #define S2DEX_G_SELECT_DL 0xB0
+ #define S2DEX_G_OBJ_LOADTXTR 0xC1
+@@ -15,6 +18,7 @@
+ #define S2DEX_G_OBJ_LDTX_RECT 0xC3
+ #define S2DEX_G_OBJ_LDTX_RECT_R 0xC4
+ #define S2DEX_G_OBJ_RENDERMODE 0xB1
++#define S2DEX_G_OBJ_RECTANGLE_R 0xB2
+ #define S2DEX_G_BGLT_LOADBLOCK 0x0033
+ #define S2DEX_G_BGLT_LOADTILE 0xFFF4
+ #define S2DEX_G_BG_FLAG_FLIPS 0x01
+@@ -95,7 +99,9 @@ namespace RT64 {
+ 
+         struct uObjTxSprite {
+             uObjTxtr txtr;
+-            // uObjSprite sprite;
++            // uObjSprite follows at byte offset 24. It is decoded field by field with
++            // S2DEXObj::decodeSprite(), so it is kept as raw (word-swapped) bytes here.
++            uint8_t sprite[24];
+         };
+ #pragma pack(pop)
+ 
+@@ -108,6 +114,13 @@ namespace RT64 {
+         void objLoadTxRect(State* state, DisplayList** dl);
+         void objLoadTxRectR(State* state, DisplayList** dl);
+         void rdpHalf0(State *state, DisplayList **dl);
++        void selectDl(State *state, DisplayList **dl);
++        void objRectangle(State *state, DisplayList **dl);
++        void objRectangleR(State *state, DisplayList **dl);
++        void objSprite(State *state, DisplayList **dl);
++        void objMoveMem(State *state, DisplayList **dl);
++        void setStatus(State *state, uint32_t sid, uint32_t value);
++        void resetObjectState(State *state);
+ 
+         void setup(GBI *gbi);
+     };
+diff --git a/src/gbi/rt64_gbi_s2dex2.cpp b/src/gbi/rt64_gbi_s2dex2.cpp
+index 23c5fc1..d452758 100644
+--- a/src/gbi/rt64_gbi_s2dex2.cpp
++++ b/src/gbi/rt64_gbi_s2dex2.cpp
+@@ -16,7 +16,8 @@ namespace RT64 {
+         void moveWord(State *state, DisplayList **dl) {
+             switch ((*dl)->p0(16, 8)) {
+             case G_MW_GENSTAT:
+-                assert(false);
++                // gSPSetStatus(sid, value): GBI2 moveword keeps the offset in the low 16 bits.
++                GBI_S2DEX::setStatus(state, (*dl)->p0(0, 16), (*dl)->w1);
+                 break;
+             default:
+                 GBI_F3DEX2::moveWord(state, dl);
+@@ -25,27 +26,22 @@ namespace RT64 {
+         }
+ 
+         void rdpHalf0(State *state, DisplayList **dl) {
++            // Latch the words for a following G_SELECT_DL.
++            state->rsp->S2D.selectDlHalf0W0 = (*dl)->w0;
++            state->rsp->S2D.selectDlHalf0W1 = (*dl)->w1;
++
+             uint8_t nextCode = (*dl + 1)->w0 >> 24;
+-            if (nextCode == S2DEX2_G_SELECT_DL) {
+-                assert(false);
+-            }
+-            else if (nextCode == F3DEX2_G_RDPHALF_1) {
++            if (nextCode == F3DEX2_G_RDPHALF_1) {
+                 GBI_RDP::texrect(state, dl);
+             }
+         }
+ 
+         void reset(State *state) {
+-            state->rsp->objRenderMode = 0x0;
+-            state->rsp->S2D.struct_buffer.fill(0);
+-            state->rsp->S2D.statuses.fill(0);
+-            state->rsp->S2D.data_02AE = -128;
++            GBI_S2DEX::resetObjectState(state);
+         }
+ 
+         void resetFromLoad(State* state) {
+-            state->rsp->objRenderMode = 0x0;
+-            state->rsp->S2D.struct_buffer.fill(0);
+-            state->rsp->S2D.statuses.fill(0);
+-            state->rsp->S2D.data_02AE = -128;
++            GBI_S2DEX::resetObjectState(state);
+         }
+ 
+         void setup(GBI *gbi) {
+@@ -71,6 +67,11 @@ namespace RT64 {
+             gbi->map[S2DEX2_G_OBJ_LDTX_SPRITE] = &GBI_S2DEX::objLoadTxSprite;
+             gbi->map[S2DEX2_G_OBJ_LDTX_RECT] = &GBI_S2DEX::objLoadTxRect;
+             gbi->map[S2DEX2_G_OBJ_LDTX_RECT_R] = &GBI_S2DEX::objLoadTxRectR;
++            gbi->map[S2DEX2_G_OBJ_RECTANGLE] = &GBI_S2DEX::objRectangle;
++            gbi->map[S2DEX2_G_OBJ_RECTANGLE_R] = &GBI_S2DEX::objRectangleR;
++            gbi->map[S2DEX2_G_OBJ_SPRITE] = &GBI_S2DEX::objSprite;
++            gbi->map[S2DEX2_G_OBJ_MOVEMEM] = &GBI_S2DEX::objMoveMem;
++            gbi->map[S2DEX2_G_SELECT_DL] = &GBI_S2DEX::selectDl;
+             gbi->map[F3DEX2_G_DL] = &GBI_F3D::runDl;
+             gbi->map[F3DEX2_G_MOVEWORD] = &moveWord;
+             gbi->map[F3DEX2_G_SETOTHERMODE_H] = &GBI_F3DEX2::setOtherModeH;
+diff --git a/src/gbi/rt64_gbi_s2dex2.h b/src/gbi/rt64_gbi_s2dex2.h
+index afe6068..abd1bbd 100644
+--- a/src/gbi/rt64_gbi_s2dex2.h
++++ b/src/gbi/rt64_gbi_s2dex2.h
+@@ -15,6 +15,10 @@
+ #define S2DEX2_G_OBJ_LDTX_SPRITE 0x06
+ #define S2DEX2_G_OBJ_LDTX_RECT 0x07
+ #define S2DEX2_G_OBJ_LDTX_RECT_R 0x08
++#define S2DEX2_G_OBJ_RECTANGLE 0x01
++#define S2DEX2_G_OBJ_SPRITE 0x02
++#define S2DEX2_G_OBJ_RECTANGLE_R 0xDA
++#define S2DEX2_G_OBJ_MOVEMEM 0xDC
+ 
+ 
+ namespace RT64 {
+diff --git a/src/gbi/rt64_s2dex_obj.cpp b/src/gbi/rt64_s2dex_obj.cpp
+new file mode 100644
+index 0000000..c919ad4
+--- /dev/null
++++ b/src/gbi/rt64_s2dex_obj.cpp
+@@ -0,0 +1,337 @@
++//
++// RT64
++//
++// S2DEX object (sprite) command math. See rt64_s2dex_obj.h.
++//
++
++#include "rt64_s2dex_obj.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++
++namespace RT64 {
++    namespace S2DEXObj {
++        static int32_t floorDiv(int64_t num, int64_t den) {
++            int64_t q = num / den;
++            if (((num % den) != 0) && ((num < 0) != (den < 0))) {
++                q--;
++            }
++
++            return int32_t(q);
++        }
++
++        static uint16_t beU16(const MatrixBytes &b, uint32_t o) {
++            return uint16_t((b[o] << 8) | b[o + 1]);
++        }
++
++        static uint32_t beU32(const MatrixBytes &b, uint32_t o) {
++            return (uint32_t(beU16(b, o)) << 16) | beU16(b, o + 2);
++        }
++
++        // Texels trimmed from each edge by the SHRINKSIZE modes, in s10.5.
++        static int32_t shrinkAmount(uint32_t renderMode) {
++            if (renderMode & OBJRM_SHRINKSIZE_2) {
++                return 32;
++            }
++            else if (renderMode & OBJRM_SHRINKSIZE_1) {
++                return 16;
++            }
++            else {
++                return 0;
++            }
++        }
++
++        Sprite decodeSprite(const uint8_t *swapped, uint32_t offset) {
++            Sprite s;
++            s.objX = int16_t(readU16(swapped, offset + 0));
++            s.scaleW = readU16(swapped, offset + 2);
++            s.imageW = readU16(swapped, offset + 4);
++            s.objY = int16_t(readU16(swapped, offset + 8));
++            s.scaleH = readU16(swapped, offset + 10);
++            s.imageH = readU16(swapped, offset + 12);
++            s.imageStride = readU16(swapped, offset + 16);
++            s.imageAdrs = readU16(swapped, offset + 18);
++            s.imageFmt = readU8(swapped, offset + 20);
++            s.imageSiz = readU8(swapped, offset + 21);
++            s.imagePal = readU8(swapped, offset + 22);
++            s.imageFlags = readU8(swapped, offset + 23);
++            return s;
++        }
++
++        Matrix decodeMatrix(const MatrixBytes &b) {
++            Matrix m;
++            m.A = int32_t(beU32(b, 0));
++            m.B = int32_t(beU32(b, 4));
++            m.C = int32_t(beU32(b, 8));
++            m.D = int32_t(beU32(b, 12));
++            m.X = int16_t(beU16(b, 16));
++            m.Y = int16_t(beU16(b, 18));
++            m.baseScaleX = beU16(b, 20);
++            m.baseScaleY = beU16(b, 22);
++            return m;
++        }
++
++        void resetMatrix(MatrixBytes &b) {
++            // Identity matrix, no translation, BaseScale 1.0.
++            const uint8_t identity[OBJ_MTX_SIZE] = {
++                0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
++                0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x04, 0x00
++            };
++
++            std::copy(std::begin(identity), std::end(identity), b.begin());
++        }
++
++        uint32_t moveMem(MatrixBytes &b, const uint8_t *swappedSrc, uint32_t w0) {
++            const uint32_t size = ((w0 >> 16) & 0xFF) + 1;
++            const uint32_t offset = (w0 & 0xFFFF) * 8;
++            uint32_t copied = 0;
++            for (uint32_t i = 0; (i < size) && ((offset + i) < OBJ_MTX_SIZE); i++) {
++                b[offset + i] = readU8(swappedSrc, i);
++                copied++;
++            }
++
++            return copied;
++        }
++
++        TileParams spriteTile(const Sprite &sprite, uint32_t renderMode) {
++            TileParams t;
++            t.fmt = sprite.imageFmt & 0x7;
++            t.siz = sprite.imageSiz & 0x3;
++            t.palette = sprite.imagePal & 0xF;
++            t.line = sprite.imageStride & 0x1FF;
++            t.tmem = sprite.imageAdrs & 0x1FF;
++            t.cms = t.cmt = (renderMode & OBJRM_NOTXCLAMP) ? TX_WRAP : TX_CLAMP;
++            t.uls = 0;
++            t.ult = 0;
++            // u10.5 image size -> 10.2 coordinate of the last texel.
++            t.lrs = uint16_t(std::max(int32_t(sprite.imageW) - 32, 0) >> 3);
++            t.lrt = uint16_t(std::max(int32_t(sprite.imageH) - 32, 0) >> 3);
++            return t;
++        }
++
++        TexRect objRectangle(const Sprite &sprite, uint32_t renderMode, bool copyMode, const Scissor &scissor, const Matrix *subMatrix) {
++            TexRect r;
++            const int32_t scaleW = std::max<int32_t>(sprite.scaleW, 1);
++            const int32_t scaleH = std::max<int32_t>(sprite.scaleH, 1);
++            const int32_t shrink = shrinkAmount(renderMode);
++            const int32_t texW = int32_t(sprite.imageW) - 2 * shrink;
++            const int32_t texH = int32_t(sprite.imageH) - 2 * shrink;
++            if ((texW <= 0) || (texH <= 0)) {
++                return r;
++            }
++
++            // Texels advanced per screen pixel (u5.10).
++            int64_t stepS = scaleW;
++            int64_t stepT = scaleH;
++            int32_t ulx = sprite.objX;
++            int32_t uly = sprite.objY;
++            if (subMatrix != nullptr) {
++                // ObjRectangleR: the position and size are additionally divided
++                // by BaseScale and offset by the 2D matrix translation.
++                const int64_t baseX = std::max<int32_t>(subMatrix->baseScaleX, 1);
++                const int64_t baseY = std::max<int32_t>(subMatrix->baseScaleY, 1);
++                ulx = subMatrix->X + floorDiv(int64_t(sprite.objX) * 1024, baseX);
++                uly = subMatrix->Y + floorDiv(int64_t(sprite.objY) * 1024, baseY);
++                stepS = std::max<int64_t>((stepS * baseX) >> 10, 1);
++                stepT = std::max<int64_t>((stepT * baseY) >> 10, 1);
++            }
++
++            // Screen size in 10.2: (u10.5 texels << 7) / u5.10 step.
++            const int32_t widthQ = int32_t((int64_t(texW) << 7) / stepS);
++            const int32_t heightQ = int32_t((int64_t(texH) << 7) / stepT);
++            if ((widthQ <= 0) || (heightQ <= 0)) {
++                return r;
++            }
++
++            int32_t lrx = ulx + widthQ;
++            int32_t lry = uly + heightQ;
++            const bool flipS = (sprite.imageFlags & OBJ_FLAG_FLIPS) != 0;
++            const bool flipT = (sprite.imageFlags & OBJ_FLAG_FLIPT) != 0;
++            int32_t dsdx = int32_t(std::min<int64_t>(stepS, 0x7FFF));
++            int32_t dtdy = int32_t(std::min<int64_t>(stepT, 0x7FFF));
++
++            // Mirrored rectangles start at the last texel and walk backwards,
++            // like a hand-written mirrored G_TEXRECT.
++            int32_t uls = flipS ? (shrink + texW - 32) : shrink;
++            int32_t ult = flipT ? (shrink + texH - 32) : shrink;
++            if (flipS) {
++                dsdx = -dsdx;
++            }
++
++            if (flipT) {
++                dtdy = -dtdy;
++            }
++
++            // Per-pixel texel step used for clipping (copy mode always 1:1).
++            int32_t clipDsdx = dsdx;
++            int32_t clipDtdy = dtdy;
++            if (copyMode) {
++                // Copy mode: 4 texels per clock, inclusive lower-right, no scaling.
++                clipDsdx = flipS ? -1024 : 1024;
++                clipDtdy = flipT ? -1024 : 1024;
++                dsdx = clipDsdx * 4;
++                dtdy = clipDtdy;
++                lrx -= 4;
++                lry -= 4;
++            }
++            else if (renderMode & OBJRM_BILERP) {
++                // Bilinear filtering samples between texel centres. Move the start
++                // so pixel centres line up with the scaled texel centres: the offset
++                // is (step - 1) / 2 texels in the walking direction (zero at 1:1).
++                auto centreCorrection = [](int32_t step) {
++                    const int32_t mag = std::abs(step);
++                    const int32_t c = (mag - 1024) / 64;
++                    return (step < 0) ? -c : c;
++                };
++
++                uls += centreCorrection(dsdx);
++                ult += centreCorrection(dtdy);
++
++                // 1/4 pixel movement: snap the rectangle to a whole pixel and
++                // shift the texture by the remaining fraction instead.
++                const int32_t fracX = ulx & 3;
++                const int32_t fracY = uly & 3;
++                ulx -= fracX;
++                uly -= fracY;
++                uls -= floorDiv(int64_t(fracX) * dsdx, 128);
++                ult -= floorDiv(int64_t(fracY) * dtdy, 128);
++            }
++
++            // Automatic clipping against the scissor box's upper-left corner. The
++            // RDP rectangle coordinates are unsigned, so negative positions must be
++            // clipped here with the texture start moved accordingly.
++            if (ulx < scissor.ulx) {
++                uls += floorDiv(int64_t(scissor.ulx - ulx) * clipDsdx, 128);
++                ulx = scissor.ulx;
++            }
++
++            if (uly < scissor.uly) {
++                ult += floorDiv(int64_t(scissor.uly - uly) * clipDtdy, 128);
++                uly = scissor.uly;
++            }
++
++            if ((ulx >= scissor.lrx) || (uly >= scissor.lry)) {
++                return r;
++            }
++
++            r.draw = copyMode ? ((lrx >= ulx) && (lry >= uly)) : ((lrx > ulx) && (lry > uly));
++            r.ulx = ulx;
++            r.uly = uly;
++            r.lrx = lrx;
++            r.lry = lry;
++            r.uls = uls;
++            r.ult = ult;
++            r.dsdx = dsdx;
++            r.dtdy = dtdy;
++            return r;
++        }
++
++        bool objSprite(const Sprite &sprite, const Matrix &m, uint32_t renderMode, Quad &q) {
++            const double scaleW = std::max<int32_t>(sprite.scaleW, 1) / 1024.0;
++            const double scaleH = std::max<int32_t>(sprite.scaleH, 1) / 1024.0;
++            const double shrink = shrinkAmount(renderMode) / 32.0;
++            const double texW = sprite.imageW / 32.0 - 2.0 * shrink;
++            const double texH = sprite.imageH / 32.0 - 2.0 * shrink;
++            if ((texW <= 0.0) || (texH <= 0.0)) {
++                return false;
++            }
++
++            double w = texW / scaleW;
++            double h = texH / scaleH;
++            double s0 = shrink, s1 = shrink + texW;
++            double t0 = shrink, t1 = shrink + texH;
++            if (renderMode & OBJRM_WIDEN) {
++                // Enlarge by 3/8 pixel in +S/+T to hide seams between sprites.
++                w += 0.375;
++                h += 0.375;
++                s1 += 0.375 * scaleW;
++                t1 += 0.375 * scaleH;
++            }
++
++            if (sprite.imageFlags & OBJ_FLAG_FLIPS) {
++                std::swap(s0, s1);
++            }
++
++            if (sprite.imageFlags & OBJ_FLAG_FLIPT) {
++                std::swap(t0, t1);
++            }
++
++            const double a = m.A / 65536.0, b = m.B / 65536.0, c = m.C / 65536.0, d = m.D / 65536.0;
++            const double tx = m.X / 4.0, ty = m.Y / 4.0;
++            const double det = a * d - b * c;
++            if (!(std::fabs(det) > 1e-12)) {
++                return false;
++            }
++
++            const double x0 = sprite.objX / 4.0, y0 = sprite.objY / 4.0;
++            const double lx[4] = { x0, x0 + w, x0, x0 + w };
++            const double ly[4] = { y0, y0, y0 + h, y0 + h };
++            const double ls[4] = { s0, s1, s0, s1 };
++            const double lt[4] = { t0, t0, t1, t1 };
++            double corrS = 0.0, corrT = 0.0;
++            if (renderMode & OBJRM_BILERP) {
++                // Screen-space texture gradients of the affine mapping.
++                const double ks = (s1 - s0) / w;
++                const double kt = (t1 - t0) / h;
++                const double dsdX = ks * d / det, dsdY = ks * -b / det;
++                const double dtdX = kt * -c / det, dtdY = kt * a / det;
++                corrS = 0.5 * (dsdX + dsdY) - 0.5;
++                corrT = 0.5 * (dtdX + dtdY) - 0.5;
++            }
++
++            for (int i = 0; i < 4; i++) {
++                q.x[i] = float(a * lx[i] + b * ly[i] + tx);
++                q.y[i] = float(c * lx[i] + d * ly[i] + ty);
++                q.s[i] = float(ls[i] + corrS);
++                q.t[i] = float(lt[i] + corrT);
++            }
++
++            return true;
++        }
++
++        void quadToTriangles(const Quad &q, float pos[24], float tc[12]) {
++            const int order[6] = { 0, 1, 2, 1, 3, 2 };
++            for (int i = 0; i < 6; i++) {
++                const int v = order[i];
++                pos[i * 4 + 0] = q.x[v];
++                pos[i * 4 + 1] = q.y[v];
++                pos[i * 4 + 2] = 0.0f;
++                pos[i * 4 + 3] = 1.0f;
++                tc[i * 2 + 0] = q.s[v];
++                tc[i * 2 + 1] = q.t[v];
++            }
++        }
++
++        SelectDlCommand decodeSelectDl(uint32_t half0W0, uint32_t half0W1, uint32_t w0, uint32_t w1) {
++            SelectDlCommand c;
++            c.sid = (half0W0 >> 16) & 0xFF;
++            c.flag = half0W1;
++            c.mask = w1;
++            c.address = ((w0 & 0xFFFF) << 16) | (half0W0 & 0xFFFF);
++            c.push = ((w0 >> 16) & 0xFF) == 0;
++            return c;
++        }
++
++        int32_t bgSliceLines(int32_t tmemSize, uint32_t tmemSliceWmax, int32_t usesBilerp, uint32_t scaleH, int16_t &imageSliceLines) {
++            // A slice wider than TMEM gives zero lines per slice. The microcode would
++            // then divide by zero (this is where GLideN64 crashed on Magical Tetris
++            // Challenge's results screen); always keep at least one line.
++            const int32_t tmemSliceLines = tmemSize / int32_t(std::max<uint32_t>(tmemSliceWmax, 1));
++            imageSliceLines = int16_t(std::max<int32_t>(tmemSliceLines - usesBilerp, 1));
++            const int64_t frameSliceLines = (int64_t(imageSliceLines) << 20) / std::max<uint32_t>(scaleH, 1);
++            return int32_t(std::clamp<int64_t>(frameSliceLines, 1, INT32_MAX));
++        }
++
++        bool selectDl(std::array<uint32_t, 4> &statuses, uint32_t sid, uint32_t flag, uint32_t mask) {
++            uint32_t &status = statuses[statusIndex(sid)];
++            if ((status & mask) == flag) {
++                return false;
++            }
++
++            status = (status & ~mask) | (flag & mask);
++            return true;
++        }
++    };
++};
+diff --git a/src/gbi/rt64_s2dex_obj.h b/src/gbi/rt64_s2dex_obj.h
+new file mode 100644
+index 0000000..b17dfba
+--- /dev/null
++++ b/src/gbi/rt64_s2dex_obj.h
+@@ -0,0 +1,147 @@
++//
++// RT64
++//
++// S2DEX 1.x / S2DEX2 object (sprite) command math.
++//
++// Clean-room implementation written from the publicly documented N64 SDK
++// behaviour of the S2DEX microcode (N64 Programming Manual chapter "S2DEX
++// Microcode", the gs2dex.h structure definitions and the n64brew wiki). It is
++// deliberately independent of RT64's State/RDP classes so it can be exercised
++// by an offline unit-test harness without a GPU.
++//
++
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++namespace RT64 {
++    namespace S2DEXObj {
++        // Values from the public GBI headers.
++        constexpr uint32_t OBJRM_NOTXCLAMP = 0x01;
++        constexpr uint32_t OBJRM_XLU = 0x02;
++        constexpr uint32_t OBJRM_ANTIALIAS = 0x04;
++        constexpr uint32_t OBJRM_BILERP = 0x08;
++        constexpr uint32_t OBJRM_SHRINKSIZE_1 = 0x10;
++        constexpr uint32_t OBJRM_SHRINKSIZE_2 = 0x20;
++        constexpr uint32_t OBJRM_WIDEN = 0x40;
++        constexpr uint8_t OBJ_FLAG_FLIPS = 0x01;
++        constexpr uint8_t OBJ_FLAG_FLIPT = 0x10;
++        constexpr uint8_t TX_WRAP = 0x0;
++        constexpr uint8_t TX_CLAMP = 0x2;
++        constexpr uint32_t OBJ_MTX_SIZE = 24;
++        constexpr uint32_t OBJ_SPRITE_SIZE = 24;
++
++        // RT64 keeps RDRAM (and buffers copied out of it) as host-endian 32-bit
++        // words, so logical big-endian byte i lives at physical index i ^ 3.
++        inline uint8_t readU8(const uint8_t *swapped, uint32_t offset) {
++            return swapped[offset ^ 3];
++        }
++
++        inline uint16_t readU16(const uint8_t *swapped, uint32_t offset) {
++            return uint16_t((readU8(swapped, offset) << 8) | readU8(swapped, offset + 1));
++        }
++
++        inline uint32_t readU32(const uint8_t *swapped, uint32_t offset) {
++            return (uint32_t(readU16(swapped, offset)) << 16) | readU16(swapped, offset + 2);
++        }
++
++        // uObjSprite_t (24 bytes).
++        struct Sprite {
++            int16_t objX = 0;        // s10.2
++            uint16_t scaleW = 1024;  // u5.10
++            uint16_t imageW = 0;     // u10.5
++            int16_t objY = 0;        // s10.2
++            uint16_t scaleH = 1024;  // u5.10
++            uint16_t imageH = 0;     // u10.5
++            uint16_t imageStride = 0; // 64-bit words
++            uint16_t imageAdrs = 0;  // TMEM address in 64-bit words
++            uint8_t imageFmt = 0;
++            uint8_t imageSiz = 0;
++            uint8_t imagePal = 0;
++            uint8_t imageFlags = 0;
++        };
++
++        // uObjMtx_t (24 bytes). uObjSubMtx_t is its last 8 bytes.
++        struct Matrix {
++            int32_t A = 0x10000, B = 0, C = 0, D = 0x10000; // s15.16
++            int16_t X = 0, Y = 0;                          // s10.2
++            uint16_t baseScaleX = 1024, baseScaleY = 1024; // u5.10
++        };
++
++        // Logical big-endian image of the 24-byte matrix area in DMEM.
++        using MatrixBytes = std::array<uint8_t, OBJ_MTX_SIZE>;
++
++        Sprite decodeSprite(const uint8_t *swapped, uint32_t offset = 0);
++        Matrix decodeMatrix(const MatrixBytes &bytes);
++        void resetMatrix(MatrixBytes &bytes);
++
++        // G_OBJ_MOVEMEM: w0 = cmd | (size - 1) << 16 | offset / 8. Copies the
++        // bytes into the matrix area, clamped to its 24 bytes. Returns the
++        // number of bytes copied.
++        uint32_t moveMem(MatrixBytes &bytes, const uint8_t *swappedSrc, uint32_t w0);
++
++        struct TileParams {
++            uint8_t fmt, siz, palette, cms, cmt;
++            uint16_t line, tmem;
++            uint16_t uls, ult, lrs, lrt; // 10.2
++        };
++
++        // Render tile description for a sprite already loaded into TMEM.
++        TileParams spriteTile(const Sprite &sprite, uint32_t renderMode);
++
++        struct Scissor {
++            int32_t ulx, uly, lrx, lry; // 10.2
++        };
++
++        // Parameters for an RDP texture rectangle.
++        struct TexRect {
++            bool draw = false;
++            int32_t ulx = 0, uly = 0, lrx = 0, lry = 0; // 10.2 screen coordinates
++            int32_t uls = 0, ult = 0;                   // s10.5
++            int32_t dsdx = 0, dtdy = 0;                 // s5.10
++        };
++
++        // G_OBJ_RECTANGLE (subMatrix == nullptr) and G_OBJ_RECTANGLE_R (the
++        // X/Y/BaseScale part of the current matrix).
++        TexRect objRectangle(const Sprite &sprite, uint32_t renderMode, bool copyMode, const Scissor &scissor, const Matrix *subMatrix);
++
++        // Four corners of a G_OBJ_SPRITE quad: 0 = UL, 1 = UR, 2 = LL, 3 = LR
++        // (in the sprite's local orientation). Positions are screen pixels and
++        // texture coordinates are texels.
++        struct Quad {
++            float x[4], y[4], s[4], t[4];
++        };
++
++        // Returns false (nothing to draw) for a degenerate sprite.
++        bool objSprite(const Sprite &sprite, const Matrix &matrix, uint32_t renderMode, Quad &quad);
++
++        // Expands a quad into two triangles in the layout RDP::drawTris expects:
++        // pos = 6 * {x, y, z, w}, tc = 6 * {s, t}.
++        void quadToTriangles(const Quad &quad, float pos[24], float tc[12]);
++
++        // gsSPSelectDL / gsSPSelectBranchDL status logic. Returns true when the
++        // display list must be executed, updating the status word.
++        bool selectDl(std::array<uint32_t, 4> &statuses, uint32_t sid, uint32_t flag, uint32_t mask);
++
++        // Fields of a gsSPSelectDL / gsSPSelectBranchDL pair:
++        //   G_RDPHALF_0: w0 = cmd | sid << 16 | (addr & 0xFFFF), w1 = flag
++        //   G_SELECT_DL: w0 = cmd | push << 16 | (addr >> 16),   w1 = mask
++        struct SelectDlCommand {
++            uint32_t sid, flag, mask, address;
++            bool push; // G_DL_PUSH (0) calls, G_DL_NOPUSH (1) branches.
++        };
++
++        SelectDlCommand decodeSelectDl(uint32_t half0W0, uint32_t half0W1, uint32_t w0, uint32_t w1);
++
++        // BG_1CYC slice sizing with divide-by-zero protection. Returns the number
++        // of frame lines per slice (s.10, always >= 1) and writes the image lines
++        // per slice (always >= 1).
++        int32_t bgSliceLines(int32_t tmemSize, uint32_t tmemSliceWmax, int32_t usesBilerp, uint32_t scaleH, int16_t &imageSliceLines);
++
++        // Index into the status array for an sid byte offset (0, 4, 8, 12).
++        inline uint32_t statusIndex(uint32_t sid) {
++            return (sid >> 2) & 0x3;
++        }
++    };
++};
+diff --git a/src/hle/rt64_rsp.h b/src/hle/rt64_rsp.h
+index 1611b7a..b69abb8 100644
+--- a/src/hle/rt64_rsp.h
++++ b/src/hle/rt64_rsp.h
+@@ -193,6 +193,11 @@ namespace RT64 {
+             std::array<uint32_t, 4> statuses;
+             // Seems to hold an id corresponding to the last command run.
+             int8_t data_02AE;
++            // Logical (big-endian) image of the uObjMtx area written by G_OBJ_MOVEMEM.
++            std::array<uint8_t, 24> objMtx;
++            // Words of the G_RDPHALF_0 that precedes a G_SELECT_DL.
++            uint32_t selectDlHalf0W0;
++            uint32_t selectDlHalf0W1;
+         } S2D;
+ 
+         struct {
+-- 
+2.47.3
+

@@ -1,0 +1,49 @@
+# N64Recomp config for Magical Tetris Challenge (USA, NMTE)
+# ROM SHA1 ca3fbd17406031a88e04bb79959d851550b641d0
+[input]
+entrypoint = 0x80000400
+# Shipped with the app (gamecode/). The app copies this file into its build folder and fills in the three paths
+# below, then runs N64Recomp in symbol-file mode on the player's own ROM (no ELF/disassembly needed).
+symbols_file_path = "mtc.syms.toml"
+rom_file_path = "rom.z64"
+output_func_path = "RecompiledFuncs"
+# Single static code section, no overlays -> no relocatable_sections_path needed.
+
+[patches]
+# The game's boot function is literally named "main" (symbol from the libultra boot convention);
+# rename it so it does not clash with the C/C++ program entry point.
+renamed = ["main"]
+# rspbootTextStart is already in N64Recomp's built-in ignore list.
+# RSP microcode blobs that live in the CPU .text section; they are data for the RSP, not MIPS CPU code.
+ignored = [
+    # libultra-internal static helpers whose public callers are reimplemented by ultramodern/librecomp:
+    # viMgrMain (vimgr.c) and the Pfs page helper in contpfs.c. Recompiling them would reference
+    # libultra internals (__osViSwapContext, __osContRamRead, ...) that the runtime does not provide.
+    "vimgr_text_01A0",
+    "contpfs_text_0078",
+    "n_aspMainTextStart",
+    "__gspF3DEX_fifo_textbin",
+    "__gspF3DLX_fifo_textbin",
+    "__gspF3DLX_Rej_fifo_textbin",
+    "__gspF3DLP_Rej_fifo_textbin",
+    "__gspL3DEX_fifo_textbin",
+    "__gspLine3D_fifo_textbin",
+    "__gspFast3D_fifo_textbin",
+    "__gspS2DEX_fifo_textbin",
+    "__gspS2DEX_fifo_d_textbin",
+    "capcom_TlbReadEntry",
+    "capcom_TlbWriteEntry",
+    "capcom_TlbUnmapAll",
+    "capcom_TlbMap",
+]
+# Capcom hand-written TLB helpers (tlbr/tlbwi + cop0 Index/EntryHi/EntryLo/PageMask).
+# Dead code in this ROM (no callers outside each other, no function pointers). N64Recomp cannot emit
+# cop0 TLB ops, so they are ignored here and re-implemented natively (logged shadow TLB) in
+# app/src/game/tlb.cpp.
+
+# Widescreen borders: tell the app which screen is showing. func_80053078 is the game's background
+# loader (a0 = ROM offset of the BG: TLUT + LZ16 CI8 image); the app maps the offset to a screen key
+# through the data-only border manifest (widescreen/data/borders.manifest) and swaps the border art.
+[[patches.hook]]
+func = "func_80053078"
+text = "extern void mtc_ws_on_bg_load(uint8_t* rdram, uint32_t rom_offset); mtc_ws_on_bg_load(rdram, (uint32_t)ctx->r4);"

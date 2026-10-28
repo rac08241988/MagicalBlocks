@@ -1,0 +1,14 @@
+Magical Blocks - unofficial fan project
+
+This setup does two things:
+  1. installs the game program and its shaders,
+  2. lets you pick your own ROM file of the game, checks it, and saves it for the game.
+
+You must supply your own legally dumped ROM of Magical Tetris Challenge (USA, Nintendo 64).
+We do not provide it, and this program does not contain the game's graphics, music or sound.
+
+Not affiliated with or endorsed by Nintendo, Capcom, Disney, or The Tetris Company.
+
+This program is free software under the GNU General Public License, version 3 (see LICENSE.txt
+in the install folder). Fonts and shaders keep their own licenses (THIRD-PARTY-NOTICES.txt,
+shaders\LICENSES).

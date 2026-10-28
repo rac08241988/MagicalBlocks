@@ -1,0 +1,16 @@
+<template name="config-menu__debug">
+    <head>
+    </head>
+    <body>
+        <form class="config__form">
+            <div class="config__hz-wrapper">
+                <div class="config__wrapper">
+                    <p>
+                        Debug tools for MagicalBlocks will go here (e.g. the TCRF test menu toggle, game-state viewer).
+                        Enable this tab with <b>"debug_mode": true</b> in general.json.
+                    </p>
+                </div>
+            </div>
+        </form>
+    </body>
+</template>

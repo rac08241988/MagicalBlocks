@@ -1,0 +1,331 @@
+<template name="config-menu__graphics">
+    <head>
+    </head>
+    <body>
+        <form class="config__form">
+            <div class="config__hz-wrapper">
+                <div class="config__wrapper" data-event-mouseout="set_cur_config_index(-1)">
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(0)">
+                        <label class="config-option__title">Preset</label>
+                        <div class="config-option__list">
+                            <select class="config-option-dropdown__select" data-value="preset" id="gfx_preset_select"
+                                data-event-blur="set_cur_config_index(-1)" data-event-focus="set_cur_config_index(0)">
+                                <option data-for="pid, i : preset_ids" data-attr-value="pid">{{preset_labels[i]}}</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(1)">
+                        <label class="config-option__title">Resolution</label>
+                        <div class="config-option__list">
+                            <select class="config-option-dropdown__select" data-value="resolution" id="gfx_resolution_select"
+                                data-event-blur="set_cur_config_index(-1)" data-event-focus="set_cur_config_index(1)">
+                                <option value="Native">Native (320x240)</option>
+                                <option value="Native2x">Native 2x (640x480)</option>
+                                <option value="720p">720p</option>
+                                <option value="1080p">1080p</option>
+                                <option value="1440p">1440p</option>
+                                <option value="2160p">4K (2160p)</option>
+                                <option value="Window">Window / display resolution</option>
+                            </select>
+                        </div>
+                        <div class="config-option__list" data-if="resolution == 'Native' || resolution == 'Native2x'">
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(1)"
+                                name="downsampling"
+                                data-checked="ds_option"
+                                value="1"
+                                id="downsampling_1" />
+                            <label class="config-option__tab-label" for="downsampling_1">Off</label>
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(1)"
+                                name="downsampling"
+                                data-checked="ds_option"
+                                value="2"
+                                id="downsampling_2" />
+                            <label class="config-option__tab-label" for="downsampling_2">2x SSAA</label>
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(1)"
+                                name="downsampling"
+                                data-checked="ds_option"
+                                value="4"
+                                id="downsampling_4" />
+                            <label class="config-option__tab-label" for="downsampling_4">4x SSAA</label>
+                            <div class="config-option__details">{{ds_info}}</div>
+                        </div>
+                    </div>
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(2)">
+                        <label class="config-option__title">Aspect Ratio</label>
+                        <div class="config-option__list">
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(2)"
+                                name="aspectratio"
+                                data-checked="ar_option"
+                                value="Original"
+                                id="aspectratio_original" />
+                            <label class="config-option__tab-label" for="aspectratio_original">4:3 (original)</label>
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(2)"
+                                name="aspectratio"
+                                data-checked="ar_option"
+                                value="Expand"
+                                id="aspectratio_expand" data-attrif-disabled="borders_on" />
+                            <label class="config-option__tab-label" for="aspectratio_expand">16:9 / widescreen</label>
+                        </div>
+                        <div class="config-option__details" data-if="borders_on">Locked to 4:3 while widescreen borders are on</div>
+                    </div>
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(7)">
+                        <label class="config-option__title">Widescreen Borders</label>
+                        <div class="config-option__list">
+                            <select class="config-option-dropdown__select" data-value="border_style" id="gfx_border_select"
+                                data-event-blur="set_cur_config_index(-1)" data-event-focus="set_cur_config_index(7)">
+                                <option data-for="bid, i : border_ids" data-attr-value="bid">{{border_labels[i]}}</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(8)">
+                        <label class="config-option__title">Shaders Apply To</label>
+                        <div class="config-option__list">
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(8)"
+                                name="shaderscope"
+                                data-checked="shader_scope"
+                                value="game"
+                                id="shaderscope_game" />
+                            <label class="config-option__tab-label" for="shaderscope_game">Game only</label>
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(8)"
+                                name="shaderscope"
+                                data-checked="shader_scope"
+                                value="all"
+                                id="shaderscope_all" />
+                            <label class="config-option__tab-label" for="shaderscope_all">Game + borders</label>
+                        </div>
+                    </div>
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(3)">
+                        <label class="config-option__title">Framerate Limiter</label>
+                        <div class="config-option__list">
+                            <select class="config-option-dropdown__select" data-value="framerate" id="gfx_framerate_select"
+                                data-event-blur="set_cur_config_index(-1)" data-event-focus="set_cur_config_index(3)">
+                                <option value="60">60 fps (original)</option>
+                                <option value="90">90 fps</option>
+                                <option value="120">120 fps</option>
+                                <option value="144">144 fps</option>
+                                <option value="238">238 fps</option>
+                                <option value="Uncapped">Uncapped</option>
+                                <option value="Custom">Custom</option>
+                                <option value="VSync">V-Sync (display refresh rate)</option>
+                            </select>
+                        </div>
+                        <div data-if="framerate == 'Custom'" class="config-option__range-wrapper config-option__list">
+                            <label class="config-option__range-label">{{framerate_custom}}</label>
+                            <input data-event-blur="set_cur_config_index(-1)" data-event-focus="set_cur_config_index(3)"
+                                id="gfx_framerate_custom" type="range" min="20" max="500" style="flex:1;margin: 0dp;"
+                                data-value="framerate_custom" />
+                        </div>
+                    </div>
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(9)">
+                        <label class="config-option__title">Frame Interpolation</label>
+                        <div class="config-option__list">
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(9)"
+                                name="frameinterp"
+                                data-checked="frame_interp"
+                                value="on"
+                                id="frameinterp_on" />
+                            <label class="config-option__tab-label" for="frameinterp_on">On</label>
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(9)"
+                                name="frameinterp"
+                                data-checked="frame_interp"
+                                value="off"
+                                id="frameinterp_off" />
+                            <label class="config-option__tab-label" for="frameinterp_off">Off (repeat frames)</label>
+                        </div>
+                    </div>
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(4)">
+                        <label class="config-option__title">Window Mode</label>
+                        <div class="config-option__list">
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(4)"
+                                name="windowmode"
+                                data-checked="wm_option"
+                                value="Windowed"
+                                id="windowmode_windowed" />
+                            <label class="config-option__tab-label" for="windowmode_windowed">Windowed</label>
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(4)"
+                                name="windowmode"
+                                data-checked="wm_option"
+                                value="Fullscreen"
+                                id="windowmode_fullscreen" />
+                            <label class="config-option__tab-label" for="windowmode_fullscreen">Fullscreen</label>
+                        </div>
+                    </div>
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(5)">
+                        <label class="config-option__title">MS Anti-Aliasing</label>
+                        <div class="config-option__list">
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(5)"
+                                name="antialiasing"
+                                data-checked="msaa_option"
+                                value="None"
+                                id="antialiasing_none" />
+                            <label class="config-option__tab-label" for="antialiasing_none">None</label>
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(5)"
+                                name="antialiasing"
+                                data-checked="msaa_option"
+                                value="MSAA2X"
+                                id="antialiasing_msaa2x" data-attrif-disabled="!msaa2x_supported" />
+                            <label class="config-option__tab-label" for="antialiasing_msaa2x">2x</label>
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(5)"
+                                name="antialiasing"
+                                data-checked="msaa_option"
+                                value="MSAA4X"
+                                id="antialiasing_msaa4x" data-attrif-disabled="!msaa4x_supported" />
+                            <label class="config-option__tab-label" for="antialiasing_msaa4x">4x</label>
+                            <div class="config-option__details" data-if="!sample_positions_supported">Not available (missing sample positions support)</div>
+                        </div>
+                    </div>
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(6)">
+                        <label class="config-option__title">Shader</label>
+                        <div class="config-option__list">
+                            <select class="config-option-dropdown__select" data-value="shader" id="gfx_shader_select"
+                                data-attrif-disabled="!shaders_supported"
+                                data-event-blur="shader_focus(0)" data-event-focus="shader_focus(1)">
+                                <option data-for="sid, i : shader_ids" data-attr-value="sid">{{shader_labels[i]}}</option>
+                            </select>
+                        </div>
+                        <div class="config-option__details" data-if="!shaders_supported">Not available in this build</div>
+                        <div class="config-option__details" data-if="shader_error != ''">{{shader_error}}</div>
+                        <div class="config-option__list">
+                            <button class="button button--secondary" id="gfx_shader_rescan" data-event-click="shader_rescan"
+                                data-event-focus="set_cur_config_index(6)" style="margin-top: 8dp; margin-right: 8dp;">
+                                <div class="button__label">Rescan</div>
+                            </button>
+                            <button class="button button--secondary" id="gfx_shader_licenses" data-event-click="toggle_shader_notices"
+                                data-event-focus="set_cur_config_index(6)" style="margin-top: 8dp;">
+                                <div class="button__label">Shader licenses</div>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="config-option" data-event-mouseover="set_cur_config_index(10)">
+                        <label class="config-option__title">Graphics API</label>
+                        <div class="config-option__list">
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(10)"
+                                name="graphicsapi"
+                                data-checked="api_option"
+                                value="Auto"
+                                id="graphicsapi_auto" />
+                            <label class="config-option__tab-label" for="graphicsapi_auto">Auto</label>
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(10)"
+                                name="graphicsapi"
+                                data-checked="api_option"
+                                value="Vulkan"
+                                id="graphicsapi_vulkan" />
+                            <label class="config-option__tab-label" for="graphicsapi_vulkan">Vulkan</label>
+                            <input type="radio"
+                                data-event-blur="set_cur_config_index(-1)"
+                                data-event-focus="set_cur_config_index(10)"
+                                name="graphicsapi"
+                                data-checked="api_option"
+                                value="D3D12"
+                                id="graphicsapi_d3d12" data-attrif-disabled="!d3d12_available" />
+                            <label class="config-option__tab-label" for="graphicsapi_d3d12">D3D12</label>
+                        </div>
+                        <div class="config-option__details">In use: {{api_active}}. Applies after a restart.</div>
+                    </div>
+                </div>
+                <div class="config__wrapper">
+                    <p data-if="cur_config_index == 10">
+                        Chooses the graphics API used to render the game. <b>Auto</b> uses <b>Vulkan</b> and falls back to <b>D3D12</b> (Windows) if Vulkan
+                        isn't available. Switch it if the game doesn't start or shows graphical problems; it takes effect the next time the game is started.
+                        You can also start the game with <b>--graphics-api vulkan</b> or <b>--graphics-api d3d12</b>.
+                    </p>
+                    <p data-if="cur_config_index == 0">
+                        Picks a combination of the options below. <b>Vanilla</b> is the original experience: 4:3, native 320x240, 60 fps.
+                        <b>Recomp</b> is a 16:9 output with widescreen borders around the original 4:3 game, at your window's resolution and 60 fps. The <b>Recomp &lt;resolution&gt; &lt;fps&gt;</b> presets
+                        also set the output resolution and framerate limiter. Changing any option below switches this to <b>Custom</b>.
+                    </p>
+                    <p data-if="cur_config_index == 1">
+                        <b>Native</b> renders at the game's original 320x240 (<b>Native 2x</b>: 640x480), optionally supersampled.
+                        <b>720p</b> to <b>4K</b> render at that resolution and size the window to match when windowed (in fullscreen the display resolution is used).
+                        <b>Window</b> follows the window/display size.
+                    </p>
+                    <p data-if="cur_config_index == 2">
+                        <b>4:3</b> keeps the original aspect ratio with pillarboxing. <b>16:9 / widescreen</b> expands the view to the window's aspect ratio.
+                        <br /><br />Note: the game draws most of its screens as 2D sprites laid out for 4:3, so <b>16:9 / widescreen</b> may show
+                        unfinished edges. Widescreen borders (below) keep the game at 4:3 and decorate the sides instead.
+                    </p>
+                    <p data-if="cur_config_index == 7">
+                        Decorates the pillarbox of a 16:9 (or wider) window with art taken from your own ROM; the art follows the screen being shown.
+                        <b>Off</b> shows plain black bars. Turning borders on keeps the game at its original 4:3 aspect ratio.
+                    </p>
+                    <p data-if="cur_config_index == 8">
+                        Chooses whether the post-processing shader is applied only to the 4:3 game image, or to the whole output including the borders.
+                    </p>
+                    <p data-if="cur_config_index == 3">
+                        Sets the presentation framerate. The game itself always runs at its original 60 Hz; above 60 the renderer draws extra in-between frames
+                        (see <b>Frame Interpolation</b>). Fixed values, <b>Uncapped</b> and <b>Custom</b> may exceed your display's refresh rate, in which case
+                        V-Sync is turned off (tearing is possible). <b>V-Sync</b> follows your display's refresh rate.
+                        <br /><br /><b>Detected display refresh rate: {{display_refresh_rate}}hz</b>
+                    </p>
+                    <p data-if="cur_config_index == 9">
+                        Above 60 fps, <b>On</b> moves sprites, scrolling layers and effects smoothly between the game's 60 Hz frames, while pieces that move
+                        in grid steps and objects that jump across the screen still snap. <b>Off</b> repeats each game frame instead (exactly like 60 fps, but presented at the higher rate).
+                    </p>
+                    <p data-if="cur_config_index == 4">
+                        Sets whether the game should display <b>Windowed</b> or <b>Fullscreen</b>. You can also use <b>F11</b> or <b>Alt + Enter</b> to toggle this option.
+                    </p>
+                    <p data-if="cur_config_index == 5">
+                        Sets the multisample anti-aliasing (MSAA) quality level. This reduces jagged edges at the expense of rendering performance.
+                    </p>
+                    <p data-if="cur_config_index == 6 && !show_shader_notices">
+                        Post-processing shader (RetroArch <b>.slangp</b> presets, run by RT64). The change applies immediately and is saved.
+                        Six permissively-licensed presets are built in; more are read from the <b>shaders</b> folder next to the game
+                        (installed by the installer), each keeping its own license.
+                        <br /><br />Current shader license: <b>{{shader_license}}</b>
+                        <br />Shaders folder: {{shader_folder}}
+                        <br /><br />Use <b>Rescan</b> after adding files to the shaders folder, and <b>Shader licenses</b> for the notices.
+                    </p>
+                    <div data-if="show_shader_notices" style="overflow-y: auto; height: 100%; font-size: 13dp;">
+                        <p><b>About the shaders</b><br/>Optional shaders in the shaders folder keep their own licenses (see shaders/README.txt and shaders/LICENSES).</p>
+                        <p data-rml="shader_notices"></p>
+                    </div>
+                </div>
+            </div>
+            <div class="config__footer">
+                <div />
+                <div>
+                    <button
+                        class="button button--secondary"
+                        data-attrif-disabled="!options_changed"
+                        onclick="apply_options"
+                        id="apply_button"
+                    >
+                        <div class="button__label">Apply<span class="prompt-font-sm">{{gfx_help__apply}}</span></div>
+                    </button>
+                </div>
+            </div>
+        </form>
+    </body>
+</template>

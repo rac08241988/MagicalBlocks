@@ -1,0 +1,1841 @@
+From 05b50becde91f80862a8bc625ab2cdc8948f88a2 Mon Sep 17 00:00:00 2001
+From: n64recomp-shaders <n64recomp-shaders@localhost>
+Date: Sun, 18 Oct 2026 04:36:09 -0400
+Subject: [PATCH 1/4] hifps: 2D draw interpolation (Interp2D) for rect/S2DEX
+ sprite draws with grid-snap/teleport rules
+
+---
+ CMakeLists.txt                           |   1 +
+ src/gbi/rt64_gbi_s2dex.cpp               |  18 ++
+ src/hle/rt64_draw_call.h                 |   5 +
+ src/hle/rt64_interp2d.cpp                | 390 +++++++++++++++++++++++
+ src/hle/rt64_interp2d.h                  |  97 ++++++
+ src/hle/rt64_interpreter.cpp             |   1 +
+ src/hle/rt64_rdp.cpp                     |   2 +
+ src/hle/rt64_shared_queue_resources.h    |   4 +
+ src/hle/rt64_state.cpp                   |  12 +
+ src/hle/rt64_state.h                     |   3 +
+ src/hle/rt64_workload_queue.cpp          |   4 +
+ src/render/rt64_framebuffer_renderer.cpp |  25 ++
+ src/render/rt64_framebuffer_renderer.h   |   6 +
+ 13 files changed, 568 insertions(+)
+ create mode 100644 src/hle/rt64_interp2d.cpp
+ create mode 100644 src/hle/rt64_interp2d.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 579cc71..c761c6d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -391,6 +391,7 @@ set (SOURCES
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_framebuffer_pair.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_framebuffer_storage.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_game_frame.cpp"
++    "${PROJECT_SOURCE_DIR}/src/hle/rt64_interp2d.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_interpreter.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_light_manager.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_present_queue.cpp"
+diff --git a/src/gbi/rt64_gbi_s2dex.cpp b/src/gbi/rt64_gbi_s2dex.cpp
+index 76c4656..eedf904 100644
+--- a/src/gbi/rt64_gbi_s2dex.cpp
++++ b/src/gbi/rt64_gbi_s2dex.cpp
+@@ -639,6 +639,7 @@ namespace RT64 {
+             float tc[12];
+             float col[24] = {};
+             S2DEXObj::quadToTriangles(quad, pos, tc);
++            state->flush(); // [magical-tetris hifps] One call per object so each can move independently.
+             state->rdp->drawTris(2, pos, tc, col, G_TX_RENDERTILE, 0);
+         }
+ 
+@@ -647,15 +648,29 @@ namespace RT64 {
+             return S2DEXObj::decodeSprite(state->rsp->S2D.struct_buffer.data(), 0);
+         }
+ 
++        // [magical-tetris hifps] Tag the next draw with the object struct's RDRAM address for 2D interpolation.
++        struct InterpSourceScope {
++            State *state;
++            InterpSourceScope(State *state, uint32_t segmentedAddress) : state(state) {
++                state->interpSourceOverride = state->rsp->fromSegmentedMasked(segmentedAddress) & RSP_DMA_MASK;
++            }
++            ~InterpSourceScope() {
++                state->interpSourceOverride = 0;
++            }
++        };
++
+         void objRectangle(State *state, DisplayList **dl) {
++            InterpSourceScope scope(state, (*dl)->w1);
+             doObjRectangle(state, readSprite(state, (*dl)->w1), false);
+         }
+ 
+         void objRectangleR(State *state, DisplayList **dl) {
++            InterpSourceScope scope(state, (*dl)->w1);
+             doObjRectangle(state, readSprite(state, (*dl)->w1), true);
+         }
+ 
+         void objSprite(State *state, DisplayList **dl) {
++            InterpSourceScope scope(state, (*dl)->w1);
+             doObjSprite(state, readSprite(state, (*dl)->w1));
+         }
+ 
+@@ -681,6 +696,7 @@ namespace RT64 {
+         }
+ 
+         void objLoadTxSprite(State *state, DisplayList **dl) {
++            InterpSourceScope scope(state, (*dl)->w1);
+         #ifdef LOG_LOADTXTR_METHODS
+             RT64_LOG_PRINTF("objLoadTxSprite::start(0x%08X)", (*dl)->w1);
+         #endif
+@@ -699,6 +715,7 @@ namespace RT64 {
+         }
+ 
+         void objLoadTxRect(State *state, DisplayList **dl) {
++            InterpSourceScope scope(state, (*dl)->w1);
+         #ifdef LOG_LOADTXTR_METHODS
+             RT64_LOG_PRINTF("objLoadTxRect::start(0x%08X)", (*dl)->w1);
+         #endif
+@@ -717,6 +734,7 @@ namespace RT64 {
+         }
+ 
+         void objLoadTxRectR(State *state, DisplayList **dl) {
++            InterpSourceScope scope(state, (*dl)->w1);
+         #ifdef LOG_LOADTXTR_METHODS
+             RT64_LOG_PRINTF("objLoadTxRectR::start(0x%08X)", (*dl)->w1);
+         #endif
+diff --git a/src/hle/rt64_draw_call.h b/src/hle/rt64_draw_call.h
+index feab830..254ad57 100644
+--- a/src/hle/rt64_draw_call.h
++++ b/src/hle/rt64_draw_call.h
+@@ -117,6 +117,11 @@ namespace RT64 {
+         // Debugging parameters.
+         uint32_t drawStatusChanges;
+ 
++        // [magical-tetris hifps] 2D interpolation identity (see rt64_interp2d.h).
++        uint32_t interpSource; // RDRAM address of the S2DEX object struct or DL command that issued the draw.
++        uint32_t interpTag;    // Explicit object id from rt64_interp_tag (0 = none).
++        uint8_t interpMode;    // Interp2D::Mode of the tag.
++
+         static std::string attributeName(DrawAttribute attribute);
+         bool identityRectScale() const;
+     };
+diff --git a/src/hle/rt64_interp2d.cpp b/src/hle/rt64_interp2d.cpp
+new file mode 100644
+index 0000000..ea70b64
+--- /dev/null
++++ b/src/hle/rt64_interp2d.cpp
+@@ -0,0 +1,390 @@
++//
++// RT64 2D frame interpolation. See rt64_interp2d.h.
++// SPDX-License-Identifier: MIT
++//
++
++#include "rt64_interp2d.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <unordered_map>
++
++#include "rt64_game_frame.h"
++#include "rt64_workload_queue.h"
++
++namespace RT64 {
++    void Interp2D::setTag(uint32_t rdramAddress, uint32_t id, Mode mode) {
++        std::scoped_lock<std::mutex> lock(tagMutex);
++        if (id == 0) {
++            tags.erase(rdramAddress);
++        }
++        else {
++            tags[rdramAddress] = { id, mode };
++        }
++    }
++
++    void Interp2D::clearTags() {
++        std::scoped_lock<std::mutex> lock(tagMutex);
++        tags.clear();
++    }
++
++    bool Interp2D::findTag(uint32_t rdramAddress, Tag &tag) {
++        std::scoped_lock<std::mutex> lock(tagMutex);
++        if (tags.empty()) {
++            return false;
++        }
++
++        auto it = tags.find(rdramAddress);
++        if (it == tags.end()) {
++            return false;
++        }
++
++        tag = it->second;
++        return true;
++    }
++
++    Interp2D::Settings Interp2D::getSettings() {
++        std::scoped_lock<std::mutex> lock(settingsMutex);
++        return settings;
++    }
++
++    void Interp2D::setSettings(const Settings &newSettings) {
++        std::scoped_lock<std::mutex> lock(settingsMutex);
++        settings = newSettings;
++    }
++
++    Interp2D::Stats Interp2D::getStats() {
++        std::scoped_lock<std::mutex> lock(statsMutex);
++        return stats;
++    }
++
++    void Interp2D::clearResults() {
++        for (auto &r : results) {
++            r.clear();
++        }
++    }
++
++    const Interp2D::CallResult *Interp2D::result(uint32_t workloadIndex, uint32_t callIndex) const {
++        if (workloadIndex >= results.size()) {
++            return nullptr;
++        }
++
++        const std::vector<CallResult> &r = results[workloadIndex];
++        if ((callIndex >= r.size()) || !r[callIndex].mapped) {
++            return nullptr;
++        }
++
++        return &r[callIndex];
++    }
++
++    namespace {
++        struct Item {
++            uint32_t callIndex;
++            bool rect;
++            float x, y, w, h;
++            FixedRect fixedRect;
++            uint64_t texHash;
++            uint32_t source;
++            int64_t sourceRel;
++            uint32_t tag;
++            Interp2D::Mode mode;
++            int32_t match = -1;
++        };
++
++        uint64_t mix(uint64_t h, uint64_t v) {
++            h ^= v + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
++            return h;
++        }
++
++        void collectItems(const Workload &workload, uint32_t f, std::vector<Item> &items) {
++            items.clear();
++            const FramebufferPair &fbPair = workload.fbPairs[f];
++            const DrawData &drawData = workload.drawData;
++            for (uint32_t p = 0; p < fbPair.projectionCount; p++) {
++                const Projection &proj = fbPair.projections[p];
++                const bool rect = (proj.type == Projection::Type::Rectangle);
++                if (!rect && (proj.type != Projection::Type::Triangle)) {
++                    continue;
++                }
++
++                for (uint32_t c = 0; c < proj.gameCallCount; c++) {
++                    const GameCall &call = proj.gameCalls[c];
++                    const DrawCall &d = call.callDesc;
++                    if (d.triangleCount == 0) {
++                        continue;
++                    }
++
++                    // Fill rects (COPY/FILL backgrounds) never move.
++                    if (d.otherMode.cycleType() == G_CYC_FILL) {
++                        continue;
++                    }
++
++                    Item it;
++                    it.callIndex = d.callIndex;
++                    it.rect = rect;
++                    if (rect) {
++                        it.fixedRect = d.rect;
++                        it.x = d.rect.ulx / 4.0f;
++                        it.y = d.rect.uly / 4.0f;
++                        it.w = (d.rect.lrx - d.rect.ulx) / 4.0f;
++                        it.h = (d.rect.lry - d.rect.uly) / 4.0f;
++                    }
++                    else {
++                        const size_t start = size_t(call.meshDesc.rawVertexStart) * 4;
++                        const size_t end = start + size_t(d.triangleCount) * 3 * 4;
++                        if (end > drawData.triPosFloats.size()) {
++                            continue;
++                        }
++
++                        float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
++                        for (size_t v = start; v < end; v += 4) {
++                            minX = std::min(minX, drawData.triPosFloats[v + 0]);
++                            minY = std::min(minY, drawData.triPosFloats[v + 1]);
++                            maxX = std::max(maxX, drawData.triPosFloats[v + 0]);
++                            maxY = std::max(maxY, drawData.triPosFloats[v + 1]);
++                        }
++
++                        it.x = minX;
++                        it.y = minY;
++                        it.w = maxX - minX;
++                        it.h = maxY - minY;
++                    }
++
++                    it.texHash = 0;
++                    if (d.textureOn && (d.tileCount > 0) && (d.tileIndex < drawData.callTiles.size())) {
++                        const DrawCallTile &t = drawData.callTiles[d.tileIndex];
++                        it.texHash = mix(t.tmemHashOrID, t.tlut);
++                    }
++
++                    it.source = d.interpSource;
++                    it.sourceRel = int64_t(d.interpSource) - int64_t(fbPair.displayListAddress);
++                    it.tag = d.interpTag;
++                    it.mode = Interp2D::Mode(d.interpMode);
++                    items.emplace_back(it);
++                }
++            }
++        }
++
++        // Pairs unmatched items that share a key. Equal counts pair in draw order, otherwise nearest first.
++        template<typename KeyFn>
++        void pairByKey(std::vector<Item> &cur, std::vector<Item> &prev, KeyFn key, bool requireNear, float nearDistance) {
++            std::unordered_map<uint64_t, std::vector<uint32_t>> curBuckets, prevBuckets;
++            for (uint32_t i = 0; i < cur.size(); i++) {
++                uint64_t k;
++                if ((cur[i].match < 0) && key(cur[i], k)) {
++                    curBuckets[k].push_back(i);
++                }
++            }
++
++            if (curBuckets.empty()) {
++                return;
++            }
++
++            for (uint32_t i = 0; i < prev.size(); i++) {
++                uint64_t k;
++                if ((prev[i].match < 0) && key(prev[i], k) && (curBuckets.find(k) != curBuckets.end())) {
++                    prevBuckets[k].push_back(i);
++                }
++            }
++
++            for (auto &bucket : curBuckets) {
++                auto pit = prevBuckets.find(bucket.first);
++                if (pit == prevBuckets.end()) {
++                    continue;
++                }
++
++                std::vector<uint32_t> &cs = bucket.second;
++                std::vector<uint32_t> &ps = pit->second;
++                if (cs.size() == ps.size()) {
++                    for (size_t j = 0; j < cs.size(); j++) {
++                        Item &c = cur[cs[j]];
++                        Item &p = prev[ps[j]];
++                        if (requireNear && (std::hypot(c.x - p.x, c.y - p.y) > nearDistance)) {
++                            continue;
++                        }
++
++                        c.match = int32_t(ps[j]);
++                        p.match = int32_t(cs[j]);
++                    }
++                }
++                else {
++                    // Greedy nearest pairs.
++                    struct Candidate { float d; uint32_t c, p; };
++                    std::vector<Candidate> candidates;
++                    candidates.reserve(cs.size() * ps.size());
++                    for (uint32_t ci : cs) {
++                        for (uint32_t pi : ps) {
++                            const float d = std::hypot(cur[ci].x - prev[pi].x, cur[ci].y - prev[pi].y);
++                            if (!requireNear || (d <= nearDistance)) {
++                                candidates.push_back({ d, ci, pi });
++                            }
++                        }
++                    }
++
++                    std::sort(candidates.begin(), candidates.end(), [](const Candidate &a, const Candidate &b) { return a.d < b.d; });
++                    for (const Candidate &cand : candidates) {
++                        if ((cur[cand.c].match < 0) && (prev[cand.p].match < 0)) {
++                            cur[cand.c].match = int32_t(cand.p);
++                            prev[cand.p].match = int32_t(cand.c);
++                        }
++                    }
++                }
++            }
++        }
++
++        bool isGridStep(float delta, float size, int minGrid) {
++            const float a = std::fabs(delta);
++            if (a < 0.01f) {
++                return true; // No movement on this axis is compatible with a grid step on the other one.
++            }
++
++            if (size < float(minGrid)) {
++                return false;
++            }
++
++            const float steps = a / size;
++            return (steps >= 0.99f) && (std::fabs(steps - std::round(steps)) < 0.02f);
++        }
++    }
++
++    void Interp2D::match(WorkloadQueue &workloadQueue, const GameFrame &curFrame, const GameFrame &prevFrame) {
++        const Settings s = getSettings();
++        if (results.size() < workloadQueue.workloads.size()) {
++            results.resize(workloadQueue.workloads.size());
++        }
++
++        for (uint32_t w : curFrame.workloads) {
++            results[w].clear();
++        }
++
++        if (!s.enabled || prevFrame.workloads.empty()) {
++            return;
++        }
++
++        if (!dumpChecked) {
++            dumpChecked = true;
++            const char *dumpPath = getenv("RT64_HIFPS_DUMP");
++            if ((dumpPath != nullptr) && (dumpPath[0] != '\0')) {
++                dumpFile = fopen(dumpPath, "w");
++            }
++        }
++
++        const bool dumping = (dumpFile != nullptr) && (dumpFrames < 2000);
++        Stats frameStats;
++        frameStats.frames = 1;
++        std::vector<Item> curItems, prevItems;
++        const size_t workloadPairs = std::min(curFrame.workloads.size(), prevFrame.workloads.size());
++        for (size_t k = 0; k < workloadPairs; k++) {
++            const uint32_t cw = curFrame.workloads[k];
++            const uint32_t pw = prevFrame.workloads[k];
++            const Workload &curWorkload = workloadQueue.workloads[cw];
++            const Workload &prevWorkload = workloadQueue.workloads[pw];
++            std::vector<CallResult> &out = results[cw];
++            out.assign(curWorkload.gameCallCount, CallResult());
++
++            const uint32_t fbPairs = std::min(curWorkload.fbPairCount, prevWorkload.fbPairCount);
++            for (uint32_t f = 0; f < fbPairs; f++) {
++                if (curWorkload.fbPairs[f].colorImage.width != prevWorkload.fbPairs[f].colorImage.width) {
++                    continue;
++                }
++
++                collectItems(curWorkload, f, curItems);
++                collectItems(prevWorkload, f, prevItems);
++                frameStats.calls += curItems.size();
++
++                // 1. Explicit tags.
++                pairByKey(curItems, prevItems, [](const Item &it, uint64_t &k) {
++                    k = mix(1, it.tag);
++                    return it.tag != 0;
++                }, false, 0.0f);
++
++                // 2. Same source struct, same kind and size (animation frames may change the texture).
++                pairByKey(curItems, prevItems, [](const Item &it, uint64_t &k) {
++                    k = mix(mix(mix(2, it.source), it.rect), mix(uint64_t(std::lround(it.w * 4)), uint64_t(std::lround(it.h * 4))));
++                    return it.source != 0;
++                }, true, s.teleportDistance * 2.0f);
++
++                // 3. Same source offset relative to the display list (double-buffered DL memory).
++                pairByKey(curItems, prevItems, [](const Item &it, uint64_t &k) {
++                    k = mix(mix(mix(3, uint64_t(it.sourceRel)), it.rect), mix(uint64_t(std::lround(it.w * 4)), uint64_t(std::lround(it.h * 4))));
++                    return it.source != 0;
++                }, true, s.teleportDistance * 2.0f);
++
++                // 4. Same texture and size.
++                pairByKey(curItems, prevItems, [](const Item &it, uint64_t &k) {
++                    k = mix(mix(mix(4, it.texHash), it.rect), mix(uint64_t(std::lround(it.w * 4)), uint64_t(std::lround(it.h * 4))));
++                    return it.texHash != 0;
++                }, true, s.teleportDistance * 2.0f);
++
++                for (const Item &c : curItems) {
++                    const char *verdict = "new";
++                    if (c.match >= 0) {
++                        const Item &p = prevItems[c.match];
++                        frameStats.matched++;
++                        const float dx = c.x - p.x;
++                        const float dy = c.y - p.y;
++                        const float dw = c.w - p.w;
++                        const float dh = c.h - p.h;
++                        const bool moved = (std::fabs(dx) > 0.01f) || (std::fabs(dy) > 0.01f) || (std::fabs(dw) > 0.01f) || (std::fabs(dh) > 0.01f);
++                        const Mode mode = (c.tag != 0) ? c.mode : Mode::Auto;
++                        verdict = "still";
++                        if (moved) {
++                            const bool sizeJump = (std::fabs(dw) > std::max(2.0f, p.w * 0.25f)) || (std::fabs(dh) > std::max(2.0f, p.h * 0.25f));
++                            if (mode == Mode::Snap) {
++                                verdict = "snap-tag";
++                                frameStats.snappedTag++;
++                            }
++                            else if ((std::hypot(dx, dy) > s.teleportDistance) || sizeJump) {
++                                verdict = "snap-teleport";
++                                frameStats.snappedTeleport++;
++                            }
++                            else if ((mode == Mode::Auto) && s.gridSnap && (std::fabs(dw) < 0.01f) && (std::fabs(dh) < 0.01f) &&
++                                isGridStep(dx, c.w, s.minGridSize) && isGridStep(dy, c.h, s.minGridSize))
++                            {
++                                verdict = "snap-grid";
++                                frameStats.snappedGrid++;
++                            }
++                            else if (c.callIndex < out.size()) {
++                                CallResult &r = out[c.callIndex];
++                                r.mapped = true;
++                                r.rect = c.rect;
++                                r.prevRect = p.fixedRect;
++                                r.dx = dx;
++                                r.dy = dy;
++                                verdict = "lerp";
++                                frameStats.moving++;
++                            }
++                        }
++                    }
++
++                    if (dumping) {
++                        fprintf(dumpFile, "F%u w%zu f%u c%u %s pos=%.2f,%.2f size=%.2fx%.2f tex=%016llx src=%08X rel=%lld tag=%u",
++                            dumpFrames, k, f, c.callIndex, c.rect ? "rect" : "tri", c.x, c.y, c.w, c.h, (unsigned long long)c.texHash, c.source, (long long)c.sourceRel, c.tag);
++                        if (c.match >= 0) {
++                            const Item &p = prevItems[c.match];
++                            fprintf(dumpFile, " <- %.2f,%.2f %s\n", p.x, p.y, verdict);
++                        }
++                        else {
++                            fprintf(dumpFile, " %s\n", verdict);
++                        }
++                    }
++                }
++            }
++        }
++
++        if (dumping) {
++            dumpFrames++;
++            fflush(dumpFile);
++        }
++
++        std::scoped_lock<std::mutex> lock(statsMutex);
++        stats.frames += frameStats.frames;
++        stats.calls += frameStats.calls;
++        stats.matched += frameStats.matched;
++        stats.moving += frameStats.moving;
++        stats.snappedGrid += frameStats.snappedGrid;
++        stats.snappedTeleport += frameStats.snappedTeleport;
++        stats.snappedTag += frameStats.snappedTag;
++    }
++};
+diff --git a/src/hle/rt64_interp2d.h b/src/hle/rt64_interp2d.h
+new file mode 100644
+index 0000000..bc74f9b
+--- /dev/null
++++ b/src/hle/rt64_interp2d.h
+@@ -0,0 +1,97 @@
++//
++// RT64 2D frame interpolation (S2DEX objects, texture rectangles, raw 2D triangles).
++// SPDX-License-Identifier: MIT
++//
++// RT64 interpolates 3D draws by matching matrices across frames. 2D games draw everything as rectangles or
++// screen-space triangles, so there is nothing to match by default and extra frames simply repeat. This module
++// matches 2D draw calls of consecutive game frames and moves (translates and, for rectangles, resizes) each
++// matched call to its position at the in-between time:
++//   1. Explicit tags: the game (via rt64_interp_tag) maps the RDRAM address of a sprite struct to an object id.
++//   2. Source: the RDRAM address of the S2DEX object struct (or the DL command) that issued the draw.
++//   3. Texture + size: the same image drawn with the same size, in draw order / nearest position.
++// Moves that look like grid steps (a multiple of the object's own size) or teleports (longer than the teleport
++// distance) snap instead of sliding.
++//
++
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include "common/rt64_common.h"
++
++namespace RT64 {
++    struct GameFrame;
++    struct WorkloadQueue;
++
++    struct Interp2D {
++        enum class Mode : uint8_t {
++            Auto = 0,   // Heuristics decide (grid-step and teleport snapping).
++            Smooth = 1, // Always interpolate when matched (still snaps on teleports).
++            Snap = 2,   // Never interpolate.
++        };
++
++        struct Settings {
++            bool enabled = true;           // false = frame repeat (extra frames are identical copies).
++            float teleportDistance = 40.0f; // N64 pixels per game frame; longer moves snap.
++            bool gridSnap = true;           // Snap moves that are whole multiples of the object's size.
++            int minGridSize = 4;            // Objects smaller than this never grid-snap.
++        };
++
++        struct Tag {
++            uint32_t id = 0;
++            Mode mode = Mode::Auto;
++        };
++
++        struct CallResult {
++            bool mapped = false;
++            bool rect = false;
++            FixedRect prevRect;       // Rectangles: the matched call's rect in the previous frame.
++            float dx = 0.0f;          // Triangles: current minus previous position, N64 pixels.
++            float dy = 0.0f;
++        };
++
++        struct Stats {
++            uint64_t frames = 0;
++            uint64_t calls = 0;
++            uint64_t matched = 0;
++            uint64_t moving = 0;
++            uint64_t snappedGrid = 0;
++            uint64_t snappedTeleport = 0;
++            uint64_t snappedTag = 0;
++        };
++
++        Settings settings;
++        std::mutex settingsMutex;
++
++        // Explicit tags, written by the game thread and read while display lists are parsed.
++        std::mutex tagMutex;
++        std::unordered_map<uint32_t, Tag> tags;
++
++        // Results of the last match, indexed by workload queue index and then by the workload's call index.
++        std::vector<std::vector<CallResult>> results;
++        Stats stats;
++        std::mutex statsMutex;
++
++        void setTag(uint32_t rdramAddress, uint32_t id, Mode mode);
++        void clearTags();
++        bool findTag(uint32_t rdramAddress, Tag &tag);
++        Settings getSettings();
++        void setSettings(const Settings &newSettings);
++        Stats getStats();
++
++        // Called by the workload queue after the regular frame matching.
++        void match(WorkloadQueue &workloadQueue, const GameFrame &curFrame, const GameFrame &prevFrame);
++        void clearResults();
++        const CallResult *result(uint32_t workloadIndex, uint32_t callIndex) const;
++
++    private:
++        FILE *dumpFile = nullptr;
++        bool dumpChecked = false;
++        uint32_t dumpFrames = 0;
++    };
++};
+diff --git a/src/hle/rt64_interpreter.cpp b/src/hle/rt64_interpreter.cpp
+index dccaa87..c828a25 100644
+--- a/src/hle/rt64_interpreter.cpp
++++ b/src/hle/rt64_interpreter.cpp
+@@ -177,6 +177,7 @@ namespace RT64 {
+             }
+             else {
+                 func = hleGBI->map[opCode];
++                state->commandAddress = uint32_t(reinterpret_cast<uint8_t *>(dl) - state->RDRAM);
+ 
+ #       ifdef DUMP_DISPLAY_LISTS
+                 RT64_LOG_PRINTF("0x%08X 0x%08X", dl->w0, dl->w1);
+diff --git a/src/hle/rt64_rdp.cpp b/src/hle/rt64_rdp.cpp
+index c852a16..2a2385a 100644
+--- a/src/hle/rt64_rdp.cpp
++++ b/src/hle/rt64_rdp.cpp
+@@ -1077,6 +1077,7 @@ namespace RT64 {
+         // We only change these once the draw state has been checked.
+         drawCall.minWorldMatrix = 0;
+         drawCall.maxWorldMatrix = 0;
++        state->setInterpIdentity();
+ 
+         if (flushedState) {
+             state->loadDrawState();
+@@ -1180,6 +1181,7 @@ namespace RT64 {
+         drawCall.rectDtdy = dtdy;
+         drawCall.rectLeftOrigin = extAlignment.leftOrigin;
+         drawCall.rectRightOrigin = extAlignment.rightOrigin;
++        state->setInterpIdentity();
+ 
+         if (flushedState) {
+             state->loadDrawState();
+diff --git a/src/hle/rt64_shared_queue_resources.h b/src/hle/rt64_shared_queue_resources.h
+index 8858dac..fa10b0e 100644
+--- a/src/hle/rt64_shared_queue_resources.h
++++ b/src/hle/rt64_shared_queue_resources.h
+@@ -12,6 +12,7 @@
+ #include "render/rt64_render_target_manager.h"
+ 
+ #include "rt64_framebuffer_manager.h"
++#include "rt64_interp2d.h"
+ 
+ #if RT_ENABLED
+ #   include "render/rt64_raytracing_resources.h"
+@@ -58,6 +59,9 @@ namespace RT64 {
+         std::condition_variable interpolatedCondition;
+         std::mutex workloadMutex;
+ 
++        // [magical-tetris hifps] 2D draw interpolation.
++        Interp2D interp2D;
++
+         void setSwapChainSize(uint32_t width, uint32_t height) {
+             std::scoped_lock<std::mutex> configurationLock(configurationMutex);
+             if ((swapChainWidth != width) || (swapChainHeight != height)) {
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+index 6b0bb31..5e2f629 100644
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -436,6 +436,18 @@ namespace RT64 {
+         drawStatus.clearChanges();
+     }
+ 
++    void State::setInterpIdentity() {
++        const uint32_t source = (interpSourceOverride != 0) ? interpSourceOverride : commandAddress;
++        drawCall.interpSource = source;
++        drawCall.interpTag = 0;
++        drawCall.interpMode = 0;
++        Interp2D::Tag tag;
++        if ((source != 0) && (ext.sharedQueueResources != nullptr) && ext.sharedQueueResources->interp2D.findTag(source, tag)) {
++            drawCall.interpTag = tag.id;
++            drawCall.interpMode = uint8_t(tag.mode);
++        }
++    }
++
+     void State::flush() {
+         if (drawCall.triangleCount == 0) {
+             return;
+diff --git a/src/hle/rt64_state.h b/src/hle/rt64_state.h
+index cded4ca..b2ffbed 100644
+--- a/src/hle/rt64_state.h
++++ b/src/hle/rt64_state.h
+@@ -94,6 +94,9 @@ namespace RT64 {
+         GameConfiguration gameConfig;
+         uint32_t displayListAddress;
+         uint64_t displayListCounter;
++        uint32_t commandAddress = 0;       // [magical-tetris hifps] RDRAM address of the DL command being run.
++        uint32_t interpSourceOverride = 0; // [magical-tetris hifps] S2DEX object struct address for the next draw.
++        void setInterpIdentity();          // [magical-tetris hifps] Fill drawCall.interp* for the draw being added.
+         bool rdramCheckPending;
+         uint32_t lastWorkloadIndex;
+         VI lastScreenVI;
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index 5b0b726..2225104 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -623,6 +623,9 @@ namespace RT64 {
+                     drawParams.postBlendNoise = workloadConfig.postBlendNoise;
+                     drawParams.postBlendNoiseNegative = workloadConfig.postBlendNoiseNegative;
+                     drawParams.maxGameCall = std::min(gameCallCountMax - gameCallCursor, fbPair.gameCallCount);
++                    drawParams.interp2D = &ext.sharedResources->interp2D;
++                    drawParams.workloadIndex = curFrame.workloads[w];
++                    drawParams.interpWeight = curFrameWeight;
+                     framebufferRenderer->addFramebuffer(drawParams);
+                 }
+                 
+@@ -952,6 +955,7 @@ namespace RT64 {
+                     matchingProfiler.reset();
+                     matchingProfiler.start();
+                     curFrame.match(ext.workloadGraphicsWorker, *this, prevFrame, ext.workloadVelocityUploader, velocityUploaderUsed, tileInterpolationUsed);
++                    ext.sharedResources->interp2D.match(*this, curFrame, prevFrame);
+                     matchingProfiler.end();
+                     matchingProfiler.log();
+ 
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index c4cf1bf..bcfae38 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1668,6 +1668,21 @@ namespace RT64 {
+ 
+                             triangles.viewport = convertViewportRect(fixedRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, horizontalMisalignment, call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin);
+ 
++                            // [magical-tetris hifps] Move the rect to its in-between position.
++                            if ((p.interp2D != nullptr) && (p.interpWeight < 1.0f)) {
++                                const Interp2D::CallResult *ir = p.interp2D->result(p.workloadIndex, call.callDesc.callIndex);
++                                if ((ir != nullptr) && ir->rect) {
++                                    const FixedRect prevFixedRect = fixRect(ir->prevRect, fbPair.scissorRect, p.fixRectLR);
++                                    const RenderViewport prevViewport = convertViewportRect(prevFixedRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, horizontalMisalignment, call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin);
++                                    const float w = p.interpWeight;
++                                    RenderViewport &v = triangles.viewport;
++                                    v.x = prevViewport.x + (v.x - prevViewport.x) * w;
++                                    v.y = prevViewport.y + (v.y - prevViewport.y) * w;
++                                    v.width = prevViewport.width + (v.width - prevViewport.width) * w;
++                                    v.height = prevViewport.height + (v.height - prevViewport.height) * w;
++                                }
++                            }
++
+                             if (p.postBlendNoise) {
+                                 // Indicate if post blend dither noise should be applied.
+                                 bool rgbDitherNoise = (call.shaderDesc.otherMode.rgbDither() == G_CD_NOISE);
+@@ -1681,6 +1696,16 @@ namespace RT64 {
+                             instanceDrawCall.type = InstanceDrawCall::Type::RawTriangles;
+                             triangles.indexStart = call.meshDesc.rawVertexStart;
+                             triangles.viewport = rawViewportWide;
++
++                            // [magical-tetris hifps] Translate 2D triangles (S2DEX sprites) to their in-between position.
++                            if ((p.interp2D != nullptr) && (p.interpWeight < 1.0f)) {
++                                const Interp2D::CallResult *ir = p.interp2D->result(p.workloadIndex, call.callDesc.callIndex);
++                                if ((ir != nullptr) && !ir->rect) {
++                                    const float back = 1.0f - p.interpWeight;
++                                    triangles.viewport.x -= ir->dx * back * p.resolutionScale.x;
++                                    triangles.viewport.y -= ir->dy * back * p.resolutionScale.y;
++                                }
++                            }
+                             break;
+                         }
+                         case Projection::Type::None:
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+index f593ab0..4d69705 100644
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include "hle/rt64_interp2d.h"
+ #include <stdint.h>
+ 
+ #include "common/rt64_emulator_configuration.h"
+@@ -147,6 +148,11 @@ namespace RT64 {
+             bool postBlendNoise;
+             bool postBlendNoiseNegative;
+             uint32_t maxGameCall;
++
++            // [magical-tetris hifps] 2D interpolation for in-between frames (weight < 1).
++            const Interp2D *interp2D = nullptr;
++            uint32_t workloadIndex = 0;
++            float interpWeight = 1.0f;
+         };
+ 
+         FramebufferRenderer(RenderWorker *worker, bool rtSupport, UserConfiguration::GraphicsAPI graphicsAPI, const ShaderLibrary *shaderLibrary);
+-- 
+2.47.3
+
+
+From fa3bdec0379dc27ff398b8fe41202c3ccaead2fa Mon Sep 17 00:00:00 2001
+From: n64recomp-shaders <n64recomp-shaders@localhost>
+Date: Sun, 18 Oct 2026 04:39:20 -0400
+Subject: [PATCH 2/4] hifps: C API, above-display-rate targets (vsync off),
+ RT64_HIFPS_LOG/RT64_HIFPS_CAPTURE instrumentation
+
+---
+ CMakeLists.txt                        |   1 +
+ src/hle/rt64_present_queue.cpp        | 194 ++++++++++++++++++++++++++
+ src/hle/rt64_shared_queue_resources.h |   9 ++
+ src/hle/rt64_workload_queue.cpp       |   3 +-
+ src/render/rt64_hifps_api.cpp         |  78 +++++++++++
+ src/render/rt64_hifps_api.h           |  71 ++++++++++
+ 6 files changed, 355 insertions(+), 1 deletion(-)
+ create mode 100644 src/render/rt64_hifps_api.cpp
+ create mode 100644 src/render/rt64_hifps_api.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c761c6d..d6e7180 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -430,6 +430,7 @@ set (SOURCES
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_vi_renderer.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_widescreen_borders.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_widescreen_api.cpp"
++    "${PROJECT_SOURCE_DIR}/src/render/rt64_hifps_api.cpp"
+ 
+     "${PROJECT_SOURCE_DIR}/src/preset/rt64_preset.cpp"
+     "${PROJECT_SOURCE_DIR}/src/preset/rt64_preset_draw_call.cpp"
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index 0c32566..567cf91 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -9,7 +9,177 @@
+ 
+ #include "rt64_workload_queue.h"
+ 
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++
+ namespace RT64 {
++    // [magical-tetris hifps] Debug instrumentation for high frame rate output (present thread only).
++    //   RT64_HIFPS_LOG=1                 once per second: presents, interpolated presents, rates, vsync, 2D matches.
++    //   RT64_HIFPS_CAPTURE=<dir>         when <dir>/trigger exists, read back the next N presented game images
++    //                                    (including interpolated ones) to <dir>/cap_NNNN.ppm and delete the trigger.
++    //                                    N comes from the trigger file contents (default 12). <dir>/frames.txt
++    //                                    lists capture index, game present id, sub-frame index and sub-frame count.
++    struct HifpsDebug {
++        bool initialized = false;
++        bool logEnabled = false;
++        std::string captureDir;
++        uint32_t captureRemaining = 0;
++        uint32_t captureIndex = 0;
++        uint32_t triggerPoll = 0;
++        std::unique_ptr<RenderBuffer> readback;
++        uint64_t readbackSize = 0;
++        uint32_t readbackWidth = 0, readbackHeight = 0, readbackRowPitch = 0;
++        RenderFormat readbackFormat = RenderFormat::UNKNOWN;
++        bool readbackPending = false;
++        FILE *framesFile = nullptr;
++        std::chrono::steady_clock::time_point logStart;
++        uint64_t presents = 0, interpolatedPresents = 0, gamePresents = 0;
++        Interp2D::Stats lastStats;
++
++        void init() {
++            if (initialized) {
++                return;
++            }
++
++            initialized = true;
++            const char *log = getenv("RT64_HIFPS_LOG");
++            logEnabled = (log != nullptr) && (log[0] != '\0') && (log[0] != '0');
++            const char *dir = getenv("RT64_HIFPS_CAPTURE");
++            if (dir != nullptr) {
++                captureDir = dir;
++            }
++
++            logStart = std::chrono::steady_clock::now();
++        }
++
++        void pollTrigger() {
++            if (captureDir.empty() || (captureRemaining > 0) || ((triggerPoll++ % 30) != 0)) {
++                return;
++            }
++
++            std::error_code ec;
++            const std::filesystem::path trigger = std::filesystem::path(captureDir) / "trigger";
++            if (!std::filesystem::exists(trigger, ec)) {
++                return;
++            }
++
++            uint32_t count = 12;
++            if (FILE *f = fopen(trigger.string().c_str(), "rb")) {
++                unsigned int n = 0;
++                if ((fscanf(f, "%u", &n) == 1) && (n > 0)) {
++                    count = std::min(n, 2000U);
++                }
++
++                fclose(f);
++            }
++
++            std::filesystem::remove(trigger, ec);
++            captureRemaining = count;
++            if (framesFile == nullptr) {
++                framesFile = fopen((std::filesystem::path(captureDir) / "frames.txt").string().c_str(), "ab");
++            }
++
++            fprintf(stderr, "[hifps] capturing %u frames to %s\n", count, captureDir.c_str());
++        }
++
++        // Records the copy of the game image into the readback buffer. Returns whether a copy was recorded.
++        bool recordCopy(RenderDevice *device, RenderCommandList *commandList, RenderTexture *texture, RenderFormat format, uint32_t width, uint32_t height) {
++            if ((captureRemaining == 0) || (texture == nullptr) || (width == 0) || (height == 0)) {
++                return false;
++            }
++
++            if ((format != RenderFormat::R8G8B8A8_UNORM) && (format != RenderFormat::R16G16B16A16_UNORM)) {
++                return false;
++            }
++
++            const uint32_t pixelSize = RenderFormatSize(format);
++            const uint32_t rowPitch = ((width * pixelSize + 255) / 256) * 256;
++            const uint64_t size = uint64_t(rowPitch) * height;
++            if ((readback == nullptr) || (readbackSize < size)) {
++                readback = device->createBuffer(RenderBufferDesc::ReadbackBuffer(size));
++                readbackSize = size;
++            }
++
++            readbackWidth = width;
++            readbackHeight = height;
++            readbackRowPitch = rowPitch;
++            readbackFormat = format;
++            commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(texture, RenderTextureLayout::COPY_SOURCE));
++            commandList->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(readback.get(), format, width, height, 1, rowPitch / pixelSize), RenderTextureCopyLocation::Subresource(texture));
++            commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(texture, RenderTextureLayout::SHADER_READ));
++            readbackPending = true;
++            return true;
++        }
++
++        // Called once the present command list has finished executing.
++        void writeCapture(uint64_t presentId, int32_t subFrame, int32_t subFrames) {
++            if (!readbackPending) {
++                return;
++            }
++
++            readbackPending = false;
++            char name[64];
++            snprintf(name, sizeof(name), "cap_%04u.ppm", captureIndex);
++            const std::string path = (std::filesystem::path(captureDir) / name).string();
++            FILE *f = fopen(path.c_str(), "wb");
++            if (f != nullptr) {
++                fprintf(f, "P6\n%u %u\n255\n", readbackWidth, readbackHeight);
++                const uint8_t *data = reinterpret_cast<const uint8_t *>(readback->map());
++                std::vector<uint8_t> row(size_t(readbackWidth) * 3);
++                const bool wide = (readbackFormat == RenderFormat::R16G16B16A16_UNORM);
++                for (uint32_t y = 0; y < readbackHeight; y++) {
++                    const uint8_t *src = data + size_t(y) * readbackRowPitch;
++                    for (uint32_t x = 0; x < readbackWidth; x++) {
++                        for (uint32_t c = 0; c < 3; c++) {
++                            row[x * 3 + c] = wide ? src[(x * 4 + c) * 2 + 1] : src[x * 4 + c];
++                        }
++                    }
++
++                    fwrite(row.data(), 1, row.size(), f);
++                }
++
++                readback->unmap();
++                fclose(f);
++            }
++
++            if (framesFile != nullptr) {
++                fprintf(framesFile, "%s present=%llu sub=%d/%d\n", name, (unsigned long long)(presentId), subFrame, subFrames);
++                fflush(framesFile);
++            }
++
++            captureIndex++;
++            captureRemaining--;
++        }
++
++        void countPresent(bool interpolated, bool firstOfGameFrame, SharedQueueResources *shared, RenderSwapChain *swapChain, uint32_t targetRate, uint32_t viOriginalRate) {
++            presents++;
++            interpolatedPresents += interpolated ? 1 : 0;
++            gamePresents += firstOfGameFrame ? 1 : 0;
++            if (!logEnabled) {
++                return;
++            }
++
++            const auto now = std::chrono::steady_clock::now();
++            const double seconds = std::chrono::duration<double>(now - logStart).count();
++            if (seconds < 1.0) {
++                return;
++            }
++
++            const Interp2D::Stats st = shared->interp2D.getStats();
++            fprintf(stderr, "[hifps] %.1f presents/s (%.1f interpolated, %.1f game frames/s) target=%u display=%u vi=%u vsync=%d | 2D calls=%llu matched=%llu moving=%llu grid=%llu teleport=%llu tag=%llu\n",
++                presents / seconds, interpolatedPresents / seconds, gamePresents / seconds, targetRate, shared->swapChainRate, viOriginalRate, swapChain->isVsyncEnabled() ? 1 : 0,
++                (unsigned long long)(st.calls - lastStats.calls), (unsigned long long)(st.matched - lastStats.matched), (unsigned long long)(st.moving - lastStats.moving),
++                (unsigned long long)(st.snappedGrid - lastStats.snappedGrid), (unsigned long long)(st.snappedTeleport - lastStats.snappedTeleport), (unsigned long long)(st.snappedTag - lastStats.snappedTag));
++            lastStats = st;
++            presents = interpolatedPresents = gamePresents = 0;
++            logStart = now;
++        }
++    };
++
++    static HifpsDebug hifpsDebug;
++
+     // PresentQueue
+ 
+     PresentQueue::PresentQueue() {
+@@ -112,6 +282,9 @@ namespace RT64 {
+             targetRate = ext.sharedResources->targetRate;
+         }
+ 
++        hifpsDebug.init();
++        hifpsDebug.pollTrigger();
++
+         RenderTarget *colorTarget = nullptr;
+         int32_t framesToPresent = 1;
+         bool lockedWorkloadMutex = false;
+@@ -337,6 +510,11 @@ namespace RT64 {
+                     }
+                 }
+                 
++                // [magical-tetris hifps] Optional readback of the game image for verification captures.
++                if (renderParams.texture != nullptr) {
++                    hifpsDebug.recordCopy(ext.device, commandList, renderParams.texture, renderParams.textureFormat, renderParams.textureWidth, renderParams.textureHeight);
++                }
++
+                 // [magical-tetris widescreen] Pillarbox border art around the game image.
+                 WidescreenBorders::Plan bordersPlan;
+                 if ((ext.widescreenBorders != nullptr) && (renderParams.texture != nullptr) && (renderParams.vi != nullptr)) {
+@@ -474,6 +652,8 @@ namespace RT64 {
+                     ext.presentGraphicsWorker->commandQueue->executeCommandLists(&commandList, 1, &waitSemaphore, 1, &signalSemaphore, 1, ext.presentGraphicsWorker->commandFence.get());
+                     ext.presentGraphicsWorker->wait();
+                 }
++
++                hifpsDebug.writeCapture(present.presentId, i, framesToPresent);
+             }
+ 
+             if (lockedWorkloadMutex) {
+@@ -509,6 +689,7 @@ namespace RT64 {
+                 presentTimestamp = Timer::current();
+                 swapChainValid = ext.swapChain->present(swapChainIndex, &waitSemaphore, 1);
+                 presentProfiler.logAndRestart();
++                hifpsDebug.countPresent(i > 0, i == 0, ext.sharedResources, ext.swapChain, targetRate, viOriginalRate);
+             }
+         }
+     }
+@@ -588,6 +769,19 @@ namespace RT64 {
+ 
+             if (processCursor >= 0) {
+                 std::unique_lock<std::mutex> threadLock(threadMutex);
++                // [magical-tetris hifps] Present without vsync when the app allows a target above the display rate.
++                {
++                    bool wantVsync = true;
++                    {
++                        std::scoped_lock<std::mutex> configurationLock(ext.sharedResources->configurationMutex);
++                        const SharedQueueResources &shared = *ext.sharedResources;
++                        wantVsync = !(shared.allowRateAboveDisplay && (shared.userConfig.refreshRate == UserConfiguration::RefreshRate::Manual) &&
++                            ((shared.swapChainRate == 0) || (uint32_t(std::max(shared.userConfig.refreshRateTarget, 0)) > shared.swapChainRate)));
++                    }
++
++                    ext.swapChain->setVsyncEnabled(wantVsync);
++                }
++
+                 const bool needsResize = ext.swapChain->needsResize() || !swapChainValid;
+                 if (needsResize) {
+                     ext.presentGraphicsWorker->commandList->begin();
+diff --git a/src/hle/rt64_shared_queue_resources.h b/src/hle/rt64_shared_queue_resources.h
+index fa10b0e..a83bbbe 100644
+--- a/src/hle/rt64_shared_queue_resources.h
++++ b/src/hle/rt64_shared_queue_resources.h
+@@ -33,6 +33,10 @@ namespace RT64 {
+         uint32_t swapChainRate = 0;
+         hlslpp::float2 resolutionScale = 1.0f;
+         uint32_t targetRate = 0;
++
++        // [magical-tetris hifps] Let a Manual refresh rate exceed the detected display rate. The present queue then
++        // switches the swap chain to immediate (no vsync) presentation so the frame limiter is what paces output.
++        bool allowRateAboveDisplay = false;
+         UserConfiguration userConfig;
+         EnhancementConfiguration enhancementConfig;
+         EmulatorConfiguration emulatorConfig;
+@@ -71,6 +75,11 @@ namespace RT64 {
+             }
+         }
+ 
++        void setAllowRateAboveDisplay(bool allow) {
++            std::scoped_lock<std::mutex> configurationLock(configurationMutex);
++            allowRateAboveDisplay = allow;
++        }
++
+         void setSwapChainRate(uint32_t rate) {
+             std::scoped_lock<std::mutex> configurationLock(configurationMutex);
+             swapChainRate = rate;
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index 2225104..ed2e9e8 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -218,7 +218,8 @@ namespace RT64 {
+             workloadConfig.targetRate = ext.sharedResources->userConfig.refreshRateTarget;
+ 
+             // Limit the target rate to the rate detected by the swap chain.
+-            if ((ext.sharedResources->swapChainRate > 0) && (workloadConfig.targetRate > ext.sharedResources->swapChainRate)) {
++            // [magical-tetris hifps] Unless the app allows going above it (vsync is then turned off).
++            if (!ext.sharedResources->allowRateAboveDisplay && (ext.sharedResources->swapChainRate > 0) && (workloadConfig.targetRate > ext.sharedResources->swapChainRate)) {
+                 workloadConfig.targetRate = ext.sharedResources->swapChainRate;
+             }
+ 
+diff --git a/src/render/rt64_hifps_api.cpp b/src/render/rt64_hifps_api.cpp
+new file mode 100644
+index 0000000..ffa4474
+--- /dev/null
++++ b/src/render/rt64_hifps_api.cpp
+@@ -0,0 +1,78 @@
++//
++// RT64 high frame rate output for 2D games: C API.
++// SPDX-License-Identifier: MIT
++//
++
++#include "rt64_hifps_api.h"
++
++#include "hle/rt64_application.h"
++
++namespace {
++    RT64::SharedQueueResources *getShared(void *app) {
++        return (app != nullptr) ? static_cast<RT64::Application *>(app)->sharedQueueResources.get() : nullptr;
++    }
++
++    template<typename F>
++    void editSettings(void *app, F f) {
++        if (RT64::SharedQueueResources *s = getShared(app)) {
++            RT64::Interp2D::Settings settings = s->interp2D.getSettings();
++            f(settings);
++            s->interp2D.setSettings(settings);
++        }
++    }
++}
++
++extern "C" {
++    int rt64_hifps_supported(void) {
++        return 1;
++    }
++
++    void rt64_hifps_set_interpolation(void *app, int enabled) {
++        editSettings(app, [&](RT64::Interp2D::Settings &s) { s.enabled = (enabled != 0); });
++    }
++
++    int rt64_hifps_get_interpolation(void *app) {
++        RT64::SharedQueueResources *s = getShared(app);
++        return ((s != nullptr) && s->interp2D.getSettings().enabled) ? 1 : 0;
++    }
++
++    void rt64_hifps_set_teleport_distance(void *app, float pixels) {
++        editSettings(app, [&](RT64::Interp2D::Settings &s) { s.teleportDistance = (pixels > 0.0f) ? pixels : 0.0f; });
++    }
++
++    void rt64_hifps_set_grid_snap(void *app, int enabled) {
++        editSettings(app, [&](RT64::Interp2D::Settings &s) { s.gridSnap = (enabled != 0); });
++    }
++
++    void rt64_hifps_set_allow_above_display(void *app, int allow) {
++        if (RT64::SharedQueueResources *s = getShared(app)) s->setAllowRateAboveDisplay(allow != 0);
++    }
++
++    void rt64_hifps_tag(void *app, unsigned int rdram_address, unsigned int id, int mode) {
++        if (RT64::SharedQueueResources *s = getShared(app)) {
++            RT64::Interp2D::Mode m = RT64::Interp2D::Mode::Auto;
++            if (mode == RT64_HIFPS_MODE_SMOOTH) m = RT64::Interp2D::Mode::Smooth;
++            else if (mode == RT64_HIFPS_MODE_SNAP) m = RT64::Interp2D::Mode::Snap;
++            s->interp2D.setTag(rdram_address & 0x00FFFFF8U, id, m);
++        }
++    }
++
++    void rt64_hifps_clear_tags(void *app) {
++        if (RT64::SharedQueueResources *s = getShared(app)) s->interp2D.clearTags();
++    }
++
++    void rt64_hifps_get_stats(void *app, rt64_hifps_stats *stats) {
++        if (stats == nullptr) return;
++        *stats = rt64_hifps_stats{};
++        if (RT64::SharedQueueResources *s = getShared(app)) {
++            const RT64::Interp2D::Stats st = s->interp2D.getStats();
++            stats->frames = st.frames;
++            stats->calls = st.calls;
++            stats->matched = st.matched;
++            stats->moving = st.moving;
++            stats->snapped_grid = st.snappedGrid;
++            stats->snapped_teleport = st.snappedTeleport;
++            stats->snapped_tag = st.snappedTag;
++        }
++    }
++}
+diff --git a/src/render/rt64_hifps_api.h b/src/render/rt64_hifps_api.h
+new file mode 100644
+index 0000000..f21daea
+--- /dev/null
++++ b/src/render/rt64_hifps_api.h
+@@ -0,0 +1,71 @@
++/*
++ * RT64 high frame rate output for 2D games: C API.
++ * SPDX-License-Identifier: MIT
++ *
++ * `app` is the RT64::Application* the game created. Safe to call from any thread while rendering.
++ *
++ * RT64 renders extra frames between game frames when the refresh rate target is above the game's VI rate.
++ * For 2D draws (texture rectangles, S2DEX objects/sprites) it matches calls across frames and moves them to
++ * their in-between position. These calls tune that matching:
++ *
++ *   rt64_hifps_set_interpolation(app, 1);             // 0 = repeat frames (extra frames are copies)
++ *   rt64_hifps_set_allow_above_display(app, 1);       // Manual targets above the monitor rate: vsync off
++ *   rt64_hifps_tag(app, sprite_struct_rdram_addr, object_id, RT64_HIFPS_MODE_SMOOTH);
++ */
++
++#ifndef RT64_HIFPS_API_H
++#define RT64_HIFPS_API_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#if defined(_WIN32)
++#   define RT64_HIFPS_API
++#else
++#   define RT64_HIFPS_API __attribute__((visibility("default")))
++#endif
++
++#define RT64_HIFPS_MODE_AUTO 0   /* heuristics: grid steps and teleports snap */
++#define RT64_HIFPS_MODE_SMOOTH 1 /* always interpolate when matched (teleports still snap) */
++#define RT64_HIFPS_MODE_SNAP 2   /* never interpolate */
++
++typedef struct rt64_hifps_stats {
++    unsigned long long frames;           /* game frames matched */
++    unsigned long long calls;            /* 2D calls seen */
++    unsigned long long matched;          /* calls matched to the previous frame */
++    unsigned long long moving;           /* matched calls that are interpolated */
++    unsigned long long snapped_grid;     /* moves snapped as grid steps */
++    unsigned long long snapped_teleport; /* moves snapped as teleports */
++    unsigned long long snapped_tag;      /* moves snapped because of a SNAP tag */
++} rt64_hifps_stats;
++
++/* 1 if this RT64 build interpolates 2D draws. */
++RT64_HIFPS_API int rt64_hifps_supported(void);
++
++/* 1 (default) = interpolate 2D draws on extra frames, 0 = repeat the game frame. */
++RT64_HIFPS_API void rt64_hifps_set_interpolation(void *app, int enabled);
++RT64_HIFPS_API int rt64_hifps_get_interpolation(void *app);
++
++/* Moves longer than this (N64 pixels per game frame, default 40) snap instead of sliding. */
++RT64_HIFPS_API void rt64_hifps_set_teleport_distance(void *app, float pixels);
++
++/* 1 (default) = moves that are whole multiples of the object's own size snap (grid pieces). */
++RT64_HIFPS_API void rt64_hifps_set_grid_snap(void *app, int enabled);
++
++/* 1 = a Manual refresh rate may exceed the detected display rate; presentation then runs without vsync. */
++RT64_HIFPS_API void rt64_hifps_set_allow_above_display(void *app, int allow);
++
++/* Tags the draws issued from an S2DEX object struct (uObjSprite / uObjBg / uObjTxtr RDRAM address, KSEG0 or
++ * physical) or a display list command address. Draws with the same id match across frames regardless of
++ * draw order; mode overrides the heuristics. id 0 removes the tag. */
++RT64_HIFPS_API void rt64_hifps_tag(void *app, unsigned int rdram_address, unsigned int id, int mode);
++RT64_HIFPS_API void rt64_hifps_clear_tags(void *app);
++
++RT64_HIFPS_API void rt64_hifps_get_stats(void *app, rt64_hifps_stats *stats);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+-- 
+2.47.3
+
+
+From ae975a8f050c12a0b2f1ca0de1204215e5b25bf5 Mon Sep 17 00:00:00 2001
+From: n64recomp-shaders <n64recomp-shaders@localhost>
+Date: Sun, 18 Oct 2026 04:58:10 -0400
+Subject: [PATCH 3/4] hifps: shift the native 2D sampling grid with
+ interpolated draws (sub-native-pixel motion), size-agnostic source matching,
+ capture dump/weight logging
+
+---
+ src/hle/rt64_interp2d.cpp                   | 40 ++++++++++++++++++---
+ src/hle/rt64_interp2d.h                     |  5 +++
+ src/hle/rt64_present_queue.cpp              | 13 ++++---
+ src/hle/rt64_workload_queue.cpp             | 17 +++++++++
+ src/render/rt64_framebuffer_renderer.cpp    |  9 +++++
+ src/render/rt64_framebuffer_renderer_call.h |  2 ++
+ src/shaders/RasterPS.hlsl                   |  2 +-
+ src/shared/rt64_raster_params.h             |  7 ++++
+ 8 files changed, 85 insertions(+), 10 deletions(-)
+
+diff --git a/src/hle/rt64_interp2d.cpp b/src/hle/rt64_interp2d.cpp
+index ea70b64..210898a 100644
+--- a/src/hle/rt64_interp2d.cpp
++++ b/src/hle/rt64_interp2d.cpp
+@@ -166,6 +166,11 @@ namespace RT64 {
+             }
+         }
+ 
++        // Position distance plus size change, so a resized object prefers its own previous instance.
++        float itemDistance(const Item &a, const Item &b) {
++            return std::hypot(a.x - b.x, a.y - b.y) + std::fabs(a.w - b.w) + std::fabs(a.h - b.h);
++        }
++
+         // Pairs unmatched items that share a key. Equal counts pair in draw order, otherwise nearest first.
+         template<typename KeyFn>
+         void pairByKey(std::vector<Item> &cur, std::vector<Item> &prev, KeyFn key, bool requireNear, float nearDistance) {
+@@ -200,7 +205,7 @@ namespace RT64 {
+                     for (size_t j = 0; j < cs.size(); j++) {
+                         Item &c = cur[cs[j]];
+                         Item &p = prev[ps[j]];
+-                        if (requireNear && (std::hypot(c.x - p.x, c.y - p.y) > nearDistance)) {
++                        if (requireNear && (itemDistance(c, p) > nearDistance)) {
+                             continue;
+                         }
+ 
+@@ -215,7 +220,7 @@ namespace RT64 {
+                     candidates.reserve(cs.size() * ps.size());
+                     for (uint32_t ci : cs) {
+                         for (uint32_t pi : ps) {
+-                            const float d = std::hypot(cur[ci].x - prev[pi].x, cur[ci].y - prev[pi].y);
++                            const float d = itemDistance(cur[ci], prev[pi]);
+                             if (!requireNear || (d <= nearDistance)) {
+                                 candidates.push_back({ d, ci, pi });
+                             }
+@@ -270,7 +275,20 @@ namespace RT64 {
+             }
+         }
+ 
+-        const bool dumping = (dumpFile != nullptr) && (dumpFrames < 2000);
++        // The first RT64_HIFPS_DUMP_FRAMES game frames (default 0 when a capture directory is set, else 2000) and
++        // every frame while a RT64_HIFPS_CAPTURE capture is running are dumped.
++        if (!dumpLimitChecked) {
++            dumpLimitChecked = true;
++            const char *limit = getenv("RT64_HIFPS_DUMP_FRAMES");
++            dumpLimit = (limit != nullptr) ? uint32_t(strtoul(limit, nullptr, 10)) : ((getenv("RT64_HIFPS_CAPTURE") != nullptr) ? 0 : 2000);
++        }
++
++        uint32_t requested = dumpRequested.load();
++        while ((requested > 0) && !dumpRequested.compare_exchange_weak(requested, requested - 1)) { }
++        const bool dumping = (dumpFile != nullptr) && ((dumpFrames < dumpLimit) || (requested > 0));
++        if (dumping && (requested > 0)) {
++            fprintf(dumpFile, "# capture-dump frame %u\n", dumpFrames);
++        }
+         Stats frameStats;
+         frameStats.frames = 1;
+         std::vector<Item> curItems, prevItems;
+@@ -311,9 +329,21 @@ namespace RT64 {
+                     return it.source != 0;
+                 }, true, s.teleportDistance * 2.0f);
+ 
+-                // 4. Same texture and size.
++                // 4. Same source (absolute, then display list relative) with a different size: scaling objects
++                // (pulsing sprites, zooming menu signs).
++                pairByKey(curItems, prevItems, [](const Item &it, uint64_t &k) {
++                    k = mix(mix(4, it.source), it.rect);
++                    return it.source != 0;
++                }, true, s.teleportDistance * 2.0f);
++
++                pairByKey(curItems, prevItems, [](const Item &it, uint64_t &k) {
++                    k = mix(mix(5, uint64_t(it.sourceRel)), it.rect);
++                    return it.source != 0;
++                }, true, s.teleportDistance * 2.0f);
++
++                // 6. Same texture and size.
+                 pairByKey(curItems, prevItems, [](const Item &it, uint64_t &k) {
+-                    k = mix(mix(mix(4, it.texHash), it.rect), mix(uint64_t(std::lround(it.w * 4)), uint64_t(std::lround(it.h * 4))));
++                    k = mix(mix(mix(6, it.texHash), it.rect), mix(uint64_t(std::lround(it.w * 4)), uint64_t(std::lround(it.h * 4))));
+                     return it.texHash != 0;
+                 }, true, s.teleportDistance * 2.0f);
+ 
+diff --git a/src/hle/rt64_interp2d.h b/src/hle/rt64_interp2d.h
+index bc74f9b..88ecce0 100644
+--- a/src/hle/rt64_interp2d.h
++++ b/src/hle/rt64_interp2d.h
+@@ -89,7 +89,12 @@ namespace RT64 {
+         void clearResults();
+         const CallResult *result(uint32_t workloadIndex, uint32_t callIndex) const;
+ 
++        // Number of upcoming game frames to dump (set by the present queue when a capture starts).
++        std::atomic<uint32_t> dumpRequested = { 0 };
++
+     private:
++        bool dumpLimitChecked = false;
++        uint32_t dumpLimit = 0;
+         FILE *dumpFile = nullptr;
+         bool dumpChecked = false;
+         uint32_t dumpFrames = 0;
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index 567cf91..b7e325f 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -54,7 +54,8 @@ namespace RT64 {
+             logStart = std::chrono::steady_clock::now();
+         }
+ 
+-        void pollTrigger() {
++
++        void pollTrigger(SharedQueueResources *shared) {
+             if (captureDir.empty() || (captureRemaining > 0) || ((triggerPoll++ % 30) != 0)) {
+                 return;
+             }
+@@ -77,11 +78,15 @@ namespace RT64 {
+ 
+             std::filesystem::remove(trigger, ec);
+             captureRemaining = count;
+-            if (framesFile == nullptr) {
+-                framesFile = fopen((std::filesystem::path(captureDir) / "frames.txt").string().c_str(), "ab");
++            // Reopened per capture so the directory can be cleared between captures.
++            if (framesFile != nullptr) {
++                fclose(framesFile);
+             }
+ 
++            framesFile = fopen((std::filesystem::path(captureDir) / "frames.txt").string().c_str(), "ab");
++
+             fprintf(stderr, "[hifps] capturing %u frames to %s\n", count, captureDir.c_str());
++            shared->interp2D.dumpRequested = count + 8;
+         }
+ 
+         // Records the copy of the game image into the readback buffer. Returns whether a copy was recorded.
+@@ -283,7 +288,7 @@ namespace RT64 {
+         }
+ 
+         hifpsDebug.init();
+-        hifpsDebug.pollTrigger();
++        hifpsDebug.pollTrigger(ext.sharedResources);
+ 
+         RenderTarget *colorTarget = nullptr;
+         int32_t framesToPresent = 1;
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index ed2e9e8..7507946 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include "rt64_workload_queue.h"
+ 
++#include <cstdlib>
++
+ #include "common/rt64_thread.h"
+ 
+ #include "rt64_present_queue.h"
+@@ -1091,6 +1093,21 @@ namespace RT64 {
+                         ext.workloadExtrasUploader->submit(ext.workloadGraphicsWorker, { extrasUpload });
+                     }
+ 
++                    // [magical-tetris hifps] RT64_HIFPS_LOG_WEIGHTS=<n>: print the weights of the first n rendered frames.
++                    {
++                        static int weightLogs = -1;
++                        if (weightLogs < 0) {
++                            const char *v = getenv("RT64_HIFPS_LOG_WEIGHTS");
++                            weightLogs = (v != nullptr) ? atoi(v) : 0;
++                        }
++
++                        if (weightLogs > 0) {
++                            weightLogs--;
++                            fprintf(stderr, "[hifps] workload %llu frame %u/%u weights prev=%.3f cur=%.3f target=%s\n", (unsigned long long)(workload.workloadId),
++                                frame, displayFrames, prevFrameWeight, curFrameWeight, (overrideTarget != nullptr) ? "interpolated" : "main");
++                        }
++                    }
++
+                     int64_t renderTimeMicro = workloadTimer.elapsedMicroseconds();
+                     threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
+                         interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed);
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index bcfae38..6edb812 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -599,6 +599,8 @@ namespace RT64 {
+                 }
+                 
+                 rasterParams.renderIndex = i;
++                rasterParams.interpGridOffsetX = triangles.gridOffsetX;
++                rasterParams.interpGridOffsetY = triangles.gridOffsetY;
+                 worker->commandList->setGraphicsPushConstants(0, &rasterParams);
+                 drawCallTriangles(drawCall);
+ 
+@@ -1615,6 +1617,8 @@ namespace RT64 {
+                         triangles.faceCount = call.callDesc.triangleCount;
+                         triangles.vertexTestZ = (vertexTestZCallIndex >= 0);
+                         triangles.postBlendDitherNoise = false;
++                        triangles.gridOffsetX = 0.0f;
++                        triangles.gridOffsetY = 0.0f;
+ 
+                         float invRatioScale = 1.0f / aspectRatioScale;
+                         float horizontalMisalignment = 0.0f;
+@@ -1676,10 +1680,13 @@ namespace RT64 {
+                                     const RenderViewport prevViewport = convertViewportRect(prevFixedRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, horizontalMisalignment, call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin);
+                                     const float w = p.interpWeight;
+                                     RenderViewport &v = triangles.viewport;
++                                    const float curX = v.x, curY = v.y;
+                                     v.x = prevViewport.x + (v.x - prevViewport.x) * w;
+                                     v.y = prevViewport.y + (v.y - prevViewport.y) * w;
+                                     v.width = prevViewport.width + (v.width - prevViewport.width) * w;
+                                     v.height = prevViewport.height + (v.height - prevViewport.height) * w;
++                                    triangles.gridOffsetX = v.x - curX;
++                                    triangles.gridOffsetY = v.y - curY;
+                                 }
+                             }
+ 
+@@ -1704,6 +1711,8 @@ namespace RT64 {
+                                     const float back = 1.0f - p.interpWeight;
+                                     triangles.viewport.x -= ir->dx * back * p.resolutionScale.x;
+                                     triangles.viewport.y -= ir->dy * back * p.resolutionScale.y;
++                                    triangles.gridOffsetX = -ir->dx * back * p.resolutionScale.x;
++                                    triangles.gridOffsetY = -ir->dy * back * p.resolutionScale.y;
+                                 }
+                             }
+                             break;
+diff --git a/src/render/rt64_framebuffer_renderer_call.h b/src/render/rt64_framebuffer_renderer_call.h
+index 1688220..279c5af 100644
+--- a/src/render/rt64_framebuffer_renderer_call.h
++++ b/src/render/rt64_framebuffer_renderer_call.h
+@@ -37,6 +37,8 @@ namespace RT64 {
+                 RenderViewport viewport;
+                 uint32_t indexStart;
+                 uint32_t faceCount;
++                float gridOffsetX; // [magical-tetris hifps] Interpolation offset (pixels) for native 2D sampling.
++                float gridOffsetY;
+                 bool vertexTestZ : 1;
+                 bool postBlendDitherNoise : 1;
+                 bool postBlendDitherNoiseNegative : 1;
+diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
+index f5beee9..e416f02 100644
+--- a/src/shaders/RasterPS.hlsl
++++ b/src/shaders/RasterPS.hlsl
+@@ -107,7 +107,7 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
+     float ddyuvy = ddy(vertexUV.y);
+     float2 lowResUV = vertexUV;
+     if (!renderFlagUpscale2D(rp.flags)) {
+-        float2 screenPos = floor(vertexPosition.xy);
++        float2 screenPos = floor(vertexPosition.xy - float2(gConstants.interpGridOffsetX, gConstants.interpGridOffsetY));
+         screenPos.x += FbParams.horizontalMisalignment;
+         lowResUV -= fmod(screenPos.xy, FbParams.resolutionScale.yy) * float2(ddxuvx, ddyuvy);
+     }
+diff --git a/src/shared/rt64_raster_params.h b/src/shared/rt64_raster_params.h
+index 339c7f3..1972435 100644
+--- a/src/shared/rt64_raster_params.h
++++ b/src/shared/rt64_raster_params.h
+@@ -12,6 +12,13 @@ namespace interop {
+     struct RasterParams {
+         uint renderIndex;
+         float2 halfPixelOffset;
++
++        // [magical-tetris hifps] Offset in pixels that 2D draws were moved by for frame interpolation. Native (non
++        // upscaled) 2D sampling snaps texture coordinates to the native pixel grid; shifting that grid by the same
++        // offset lets interpolated sprites move in output-pixel steps while keeping their native pixel look.
++        // Scalars so the CPU and HLSL layouts match.
++        float interpGridOffsetX;
++        float interpGridOffsetY;
+     };
+ #ifdef HLSL_CPU
+ };
+-- 
+2.47.3
+
+
+From f2fa091666d7d33801206c714d7e05d47d9dd946 Mon Sep 17 00:00:00 2001
+From: n64recomp-shaders <n64recomp-shaders@localhost>
+Date: Sun, 18 Oct 2026 05:13:34 -0400
+Subject: [PATCH 4/4] hifps: range tags (rt64_hifps_set_tag_ranges) for
+ game-side draw hooks, tagged-call stats
+
+---
+ src/hle/rt64_interp2d.cpp      | 40 ++++++++++++++++++++++++++++++++++
+ src/hle/rt64_interp2d.h        | 18 +++++++++++++++
+ src/hle/rt64_present_queue.cpp |  5 +++--
+ src/hle/rt64_state.cpp         | 12 +++++++---
+ src/render/rt64_hifps_api.cpp  | 39 +++++++++++++++++++++++++++++----
+ src/render/rt64_hifps_api.h    | 17 +++++++++++++++
+ 6 files changed, 122 insertions(+), 9 deletions(-)
+
+diff --git a/src/hle/rt64_interp2d.cpp b/src/hle/rt64_interp2d.cpp
+index 210898a..e9dc4e3 100644
+--- a/src/hle/rt64_interp2d.cpp
++++ b/src/hle/rt64_interp2d.cpp
+@@ -44,6 +44,41 @@ namespace RT64 {
+         return true;
+     }
+ 
++    bool Interp2D::findTagRange(uint32_t rdramAddress, Tag &tag) {
++        std::scoped_lock<std::mutex> lock(tagMutex);
++        if (tagRanges.empty()) {
++            return false;
++        }
++
++        // Walk back from the last range starting at or before the address; nested ranges sit right before it.
++        auto it = tagRanges.upper_bound(rdramAddress);
++        for (int steps = 0; (it != tagRanges.begin()) && (steps < 16); steps++) {
++            --it;
++            const TagRange &r = it->second;
++            if (rdramAddress < r.end) {
++                tag = { r.id, r.mode };
++                return true;
++            }
++        }
++
++        return false;
++    }
++
++    void Interp2D::setTagRanges(uint32_t clearStart, uint32_t clearEnd, const TagRange *ranges, size_t count) {
++        std::scoped_lock<std::mutex> lock(tagMutex);
++        tagRanges.erase(tagRanges.lower_bound(clearStart), tagRanges.lower_bound(clearEnd));
++        for (size_t i = 0; i < count; i++) {
++            if ((ranges[i].end > ranges[i].start) && (ranges[i].id != 0)) {
++                tagRanges[ranges[i].start] = ranges[i];
++            }
++        }
++    }
++
++    void Interp2D::clearTagRanges() {
++        std::scoped_lock<std::mutex> lock(tagMutex);
++        tagRanges.clear();
++    }
++
+     Interp2D::Settings Interp2D::getSettings() {
+         std::scoped_lock<std::mutex> lock(settingsMutex);
+         return settings;
+@@ -349,6 +384,10 @@ namespace RT64 {
+ 
+                 for (const Item &c : curItems) {
+                     const char *verdict = "new";
++                    if (c.tag != 0) {
++                        frameStats.tagged++;
++                    }
++
+                     if (c.match >= 0) {
+                         const Item &p = prevItems[c.match];
+                         frameStats.matched++;
+@@ -416,5 +455,6 @@ namespace RT64 {
+         stats.snappedGrid += frameStats.snappedGrid;
+         stats.snappedTeleport += frameStats.snappedTeleport;
+         stats.snappedTag += frameStats.snappedTag;
++        stats.tagged += frameStats.tagged;
+     }
+ };
+diff --git a/src/hle/rt64_interp2d.h b/src/hle/rt64_interp2d.h
+index 88ecce0..fccafb2 100644
+--- a/src/hle/rt64_interp2d.h
++++ b/src/hle/rt64_interp2d.h
+@@ -17,6 +17,7 @@
+ 
+ #include <atomic>
+ #include <cstdint>
++#include <map>
+ #include <mutex>
+ #include <string>
+ #include <unordered_map>
+@@ -63,6 +64,7 @@ namespace RT64 {
+             uint64_t snappedGrid = 0;
+             uint64_t snappedTeleport = 0;
+             uint64_t snappedTag = 0;
++            uint64_t tagged = 0;
+         };
+ 
+         Settings settings;
+@@ -72,6 +74,17 @@ namespace RT64 {
+         std::mutex tagMutex;
+         std::unordered_map<uint32_t, Tag> tags;
+ 
++        // Range tags: every draw whose display list command (or S2DEX object struct) lies in [start, end) gets the
++        // range's id. Nested ranges are allowed; the innermost (latest start) range wins.
++        struct TagRange {
++            uint32_t start = 0;
++            uint32_t end = 0;
++            uint32_t id = 0;
++            Mode mode = Mode::Auto;
++        };
++
++        std::map<uint32_t, TagRange> tagRanges;
++
+         // Results of the last match, indexed by workload queue index and then by the workload's call index.
+         std::vector<std::vector<CallResult>> results;
+         Stats stats;
+@@ -80,6 +93,11 @@ namespace RT64 {
+         void setTag(uint32_t rdramAddress, uint32_t id, Mode mode);
+         void clearTags();
+         bool findTag(uint32_t rdramAddress, Tag &tag);
++        bool findTagRange(uint32_t rdramAddress, Tag &tag);
++
++        // Replace every range starting in [clearStart, clearEnd) with the given ranges (one display list's worth).
++        void setTagRanges(uint32_t clearStart, uint32_t clearEnd, const TagRange *ranges, size_t count);
++        void clearTagRanges();
+         Settings getSettings();
+         void setSettings(const Settings &newSettings);
+         Stats getStats();
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index b7e325f..eb34f79 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -173,10 +173,11 @@ namespace RT64 {
+             }
+ 
+             const Interp2D::Stats st = shared->interp2D.getStats();
+-            fprintf(stderr, "[hifps] %.1f presents/s (%.1f interpolated, %.1f game frames/s) target=%u display=%u vi=%u vsync=%d | 2D calls=%llu matched=%llu moving=%llu grid=%llu teleport=%llu tag=%llu\n",
++            fprintf(stderr, "[hifps] %.1f presents/s (%.1f interpolated, %.1f game frames/s) target=%u display=%u vi=%u vsync=%d | 2D calls=%llu matched=%llu moving=%llu grid=%llu teleport=%llu tag=%llu tagged=%llu\n",
+                 presents / seconds, interpolatedPresents / seconds, gamePresents / seconds, targetRate, shared->swapChainRate, viOriginalRate, swapChain->isVsyncEnabled() ? 1 : 0,
+                 (unsigned long long)(st.calls - lastStats.calls), (unsigned long long)(st.matched - lastStats.matched), (unsigned long long)(st.moving - lastStats.moving),
+-                (unsigned long long)(st.snappedGrid - lastStats.snappedGrid), (unsigned long long)(st.snappedTeleport - lastStats.snappedTeleport), (unsigned long long)(st.snappedTag - lastStats.snappedTag));
++                (unsigned long long)(st.snappedGrid - lastStats.snappedGrid), (unsigned long long)(st.snappedTeleport - lastStats.snappedTeleport), (unsigned long long)(st.snappedTag - lastStats.snappedTag),
++                (unsigned long long)(st.tagged - lastStats.tagged));
+             lastStats = st;
+             presents = interpolatedPresents = gamePresents = 0;
+             logStart = now;
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+index 5e2f629..6082c8a 100644
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -442,9 +442,15 @@ namespace RT64 {
+         drawCall.interpTag = 0;
+         drawCall.interpMode = 0;
+         Interp2D::Tag tag;
+-        if ((source != 0) && (ext.sharedQueueResources != nullptr) && ext.sharedQueueResources->interp2D.findTag(source, tag)) {
+-            drawCall.interpTag = tag.id;
+-            drawCall.interpMode = uint8_t(tag.mode);
++        if ((source != 0) && (ext.sharedQueueResources != nullptr)) {
++            Interp2D &interp2D = ext.sharedQueueResources->interp2D;
++            // Exact struct tags first, then the range tag around the display list command, then around the struct.
++            if (interp2D.findTag(source, tag) || interp2D.findTagRange(commandAddress, tag) ||
++                ((source != commandAddress) && interp2D.findTagRange(source, tag)))
++            {
++                drawCall.interpTag = tag.id;
++                drawCall.interpMode = uint8_t(tag.mode);
++            }
+         }
+     }
+ 
+diff --git a/src/render/rt64_hifps_api.cpp b/src/render/rt64_hifps_api.cpp
+index ffa4474..e225598 100644
+--- a/src/render/rt64_hifps_api.cpp
++++ b/src/render/rt64_hifps_api.cpp
+@@ -7,7 +7,15 @@
+ 
+ #include "hle/rt64_application.h"
+ 
++#include <vector>
++
+ namespace {
++    RT64::Interp2D::Mode toMode(int mode) {
++        if (mode == RT64_HIFPS_MODE_SMOOTH) return RT64::Interp2D::Mode::Smooth;
++        if (mode == RT64_HIFPS_MODE_SNAP) return RT64::Interp2D::Mode::Snap;
++        return RT64::Interp2D::Mode::Auto;
++    }
++
+     RT64::SharedQueueResources *getShared(void *app) {
+         return (app != nullptr) ? static_cast<RT64::Application *>(app)->sharedQueueResources.get() : nullptr;
+     }
+@@ -50,10 +58,7 @@ extern "C" {
+ 
+     void rt64_hifps_tag(void *app, unsigned int rdram_address, unsigned int id, int mode) {
+         if (RT64::SharedQueueResources *s = getShared(app)) {
+-            RT64::Interp2D::Mode m = RT64::Interp2D::Mode::Auto;
+-            if (mode == RT64_HIFPS_MODE_SMOOTH) m = RT64::Interp2D::Mode::Smooth;
+-            else if (mode == RT64_HIFPS_MODE_SNAP) m = RT64::Interp2D::Mode::Snap;
+-            s->interp2D.setTag(rdram_address & 0x00FFFFF8U, id, m);
++            s->interp2D.setTag(rdram_address & 0x00FFFFF8U, id, toMode(mode));
+         }
+     }
+ 
+@@ -61,6 +66,31 @@ extern "C" {
+         if (RT64::SharedQueueResources *s = getShared(app)) s->interp2D.clearTags();
+     }
+ 
++    void rt64_hifps_set_tag_ranges(void *app, unsigned int clear_start, unsigned int clear_end,
++        const rt64_hifps_tag_range *ranges, unsigned int count)
++    {
++        if (RT64::SharedQueueResources *s = getShared(app)) {
++            std::vector<RT64::Interp2D::TagRange> converted;
++            converted.reserve(count);
++            for (unsigned int i = 0; (ranges != nullptr) && (i < count); i++) {
++                RT64::Interp2D::TagRange r;
++                r.start = ranges[i].start & 0x00FFFFFFU;
++                r.end = r.start + (ranges[i].end - ranges[i].start);
++                r.id = ranges[i].id;
++                r.mode = toMode(ranges[i].mode);
++                converted.push_back(r);
++            }
++
++            const uint32_t clearStart = clear_start & 0x00FFFFFFU;
++            const uint32_t clearEnd = clearStart + (clear_end - clear_start);
++            s->interp2D.setTagRanges(clearStart, clearEnd, converted.data(), converted.size());
++        }
++    }
++
++    void rt64_hifps_clear_tag_ranges(void *app) {
++        if (RT64::SharedQueueResources *s = getShared(app)) s->interp2D.clearTagRanges();
++    }
++
+     void rt64_hifps_get_stats(void *app, rt64_hifps_stats *stats) {
+         if (stats == nullptr) return;
+         *stats = rt64_hifps_stats{};
+@@ -73,6 +103,7 @@ extern "C" {
+             stats->snapped_grid = st.snappedGrid;
+             stats->snapped_teleport = st.snappedTeleport;
+             stats->snapped_tag = st.snappedTag;
++            stats->tagged = st.tagged;
+         }
+     }
+ }
+diff --git a/src/render/rt64_hifps_api.h b/src/render/rt64_hifps_api.h
+index f21daea..3ae3be7 100644
+--- a/src/render/rt64_hifps_api.h
++++ b/src/render/rt64_hifps_api.h
+@@ -38,6 +38,7 @@ typedef struct rt64_hifps_stats {
+     unsigned long long snapped_grid;     /* moves snapped as grid steps */
+     unsigned long long snapped_teleport; /* moves snapped as teleports */
+     unsigned long long snapped_tag;      /* moves snapped because of a SNAP tag */
++    unsigned long long tagged;           /* calls that carried an explicit tag (point or range) */
+ } rt64_hifps_stats;
+ 
+ /* 1 if this RT64 build interpolates 2D draws. */
+@@ -62,6 +63,22 @@ RT64_HIFPS_API void rt64_hifps_set_allow_above_display(void *app, int allow);
+ RT64_HIFPS_API void rt64_hifps_tag(void *app, unsigned int rdram_address, unsigned int id, int mode);
+ RT64_HIFPS_API void rt64_hifps_clear_tags(void *app);
+ 
++/* Range tags, for hooks around the game's draw functions: every draw whose display list command (or S2DEX
++ * object struct) lies in [start, end) gets the range's id. Nested ranges are allowed (the innermost wins).
++ * rt64_hifps_set_tag_ranges replaces all ranges starting in [clear_start, clear_end) with `count` new ones in
++ * one step; call it with one display list's ranges before RT64 processes that display list. Addresses are
++ * KSEG0 or physical. */
++typedef struct rt64_hifps_tag_range {
++    unsigned int start;
++    unsigned int end;
++    unsigned int id;
++    int mode;
++} rt64_hifps_tag_range;
++
++RT64_HIFPS_API void rt64_hifps_set_tag_ranges(void *app, unsigned int clear_start, unsigned int clear_end,
++    const rt64_hifps_tag_range *ranges, unsigned int count);
++RT64_HIFPS_API void rt64_hifps_clear_tag_ranges(void *app);
++
+ RT64_HIFPS_API void rt64_hifps_get_stats(void *app, rt64_hifps_stats *stats);
+ 
+ #ifdef __cplusplus
+-- 
+2.47.3
+

@@ -1,0 +1,48 @@
+# ---- Never commit ROMs or anything derived from them ----
+*.z64
+*.n64
+*.v64
+*.rom
+*.bin
+/rom/
+RecompiledFuncs/
+RecompiledPatches/
+/rsp/
+*.elf
+# extracted / dumped game assets
+/extracted/
+/assets/extracted/
+/dumps/
+
+# ---- build output ----
+/build*/
+/dist/
+*.exe
+*.dll
+*.zip
+compile_commands.json
+
+# ---- vendored dependency copies (see deps.lock / tools/fetch_deps.sh) ----
+/lib/N64ModernRuntime/
+/lib/RmlUi/
+/lib/lunasvg/
+/lib/rt64/
+# worktrees symlink these to ../app (a trailing-slash pattern doesn't match a symlink)
+/lib/N64ModernRuntime
+/lib/RmlUi
+/lib/lunasvg
+/rsp
+/RecompiledFuncs
+
+# ---- local user data ----
+portable.txt
+shadercache/
+RecompiledFuncs-trace/
+RecompiledFuncs-hifps/
+mtc_trace.txt
+
+# game screenshots are never committed (copyrighted art); only the two menu screenshots below
+/docs/screenshots/*.png
+/docs/screenshots/*.jpg
+!/docs/screenshots/launcher.png
+!/docs/screenshots/settings-graphics.png

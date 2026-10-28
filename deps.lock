@@ -1,0 +1,20 @@
+# Pinned upstream dependencies for MagicalBlocks (consumed by tools/fetch_deps.sh)
+# name                 url                                                   commit
+N64ModernRuntime       https://github.com/N64Recomp/N64ModernRuntime.git      cdf5abb
+RmlUi                  https://github.com/mikke89/RmlUi.git                   7a06f27db04fe5d13a5dacc19b2b4544673a4eca
+lunasvg                https://github.com/sammycage/lunasvg.git               4166d0cccfc059b39d5ecfc372524375e59448f9
+rt64                   https://github.com/rt64/rt64.git                       23cab603c4f9f4a8b369b38e036f1aa484603878
+# rt64 is used with patches on top (in patches-deps/), equal to branch `hifps` (HEAD f2fa091) of
+# ../rt64-widescreen (a worktree of ../rt64; hifps sits on widescreen 2c8449f, on top of shaders 198bb1d):
+#   patches-deps/rt64-mingw-cross.diff     -> a7270c0  mingw cross fixes
+#   patches-deps/rt64-s2dex-objects.patch  -> 5a34202  S2DEX object commands
+#   patches-deps/rt64-shaders.patch        -> fd7c454, b21023c, 198bb1d  slang post-processing (+ glslang submodule)
+#   patches-deps/rt64-widescreen.patch     -> b2c88bd  S2DEX BG_COPY TMEM line stride fix
+#                                             2c8449f  widescreen borders: pillarbox canvas renderer + C API
+#   patches-deps/rt64-hifps.patch          -> 05b50be, fa3bdec, ae975a8, f2fa091  high fps: 2D draw interpolation
+#                                             (Interp2D), above-display-rate targets, hifps C API + range tags
+# Widescreen border composer: ../widescreen (MTC_WIDESCREEN_DIR; module + data-only manifest, no art).
+# The app makes no further RT64 changes.
+# Code generators (host tools, not linked): N64Recomp ffb39cd (N64Recomp + RSPRecomp), splat (see ../disasm).
+# Vendored in-tree (small, permissive): concurrentqueue, GamepadMotionHelpers, SlotMap, FindFreetype.cmake
+# (copied from Zelda64Recomp b65c482).

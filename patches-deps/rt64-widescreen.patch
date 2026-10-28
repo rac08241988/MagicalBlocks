@@ -1,0 +1,764 @@
+From b2c88bd971be88af103613557858569b12ad4702 Mon Sep 17 00:00:00 2001
+From: n64recomp-shaders <n64recomp-shaders@localhost>
+Date: Sun, 18 Oct 2026 02:43:04 -0400
+Subject: [PATCH 1/2] S2DEX BG_COPY: fix TMEM line stride for 4/8-bit images
+ and slice by whole rows
+
+The TMEM line stride was computed as imageW >> (2 + siz), which is only
+correct for 16/32-bit images. For CI8 backgrounds it was 4x too large,
+so each multi-row LoadTile overflowed into the upper half of TMEM and
+overwrote the TLUT, producing garbled blocks (Magical Tetris Challenge
+title screen). Also stop halving tmemH for CI images (guS2DInitBg already
+accounts for it), which produced fractional 2.5-row slices, and draw the
+remaining rows of the last slice.
+---
+ src/gbi/rt64_gbi_s2dex.cpp | 42 +++++++++++++++++++++++++-------------
+ 1 file changed, 28 insertions(+), 14 deletions(-)
+
+diff --git a/src/gbi/rt64_gbi_s2dex.cpp b/src/gbi/rt64_gbi_s2dex.cpp
+index 896334a..76c4656 100644
+--- a/src/gbi/rt64_gbi_s2dex.cpp
++++ b/src/gbi/rt64_gbi_s2dex.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include "rt64_gbi_s2dex.h"
+ 
++#include <algorithm>
++
+ #include "../include/rt64_extended_gbi.h"
+ 
+ #include "rt64_gbi_extended.h"
+@@ -447,8 +449,13 @@ namespace RT64 {
+             assert(bg.imageLoad == S2DEX_G_BGLT_LOADTILE); // TODO: Only the load tile version is implemented.
+             
+             const uint16_t TMEMAddress = 0;
+-            const uint8_t lineShiftOffset = (bg.imageSiz == G_IM_SIZ_32b) ? 1 : 0;
+-            const uint16_t bgLine = bg.imageW >> (2 + bg.imageSiz - lineShiftOffset);
++            // TMEM line stride in 64-bit words for one image row. 32-bit images are split across both TMEM halves,
++            // so they use the same stride as a 16-bit image. The previous formula (imageW >> (2 + siz)) was only
++            // correct for 16/32-bit images: for 8-bit and 4-bit images it produced a stride 4x/16x too large, so
++            // multi-row loads overflowed into the upper half of TMEM and corrupted the TLUT of CI backgrounds.
++            const uint32_t lineSiz = (bg.imageSiz == G_IM_SIZ_32b) ? G_IM_SIZ_16b : bg.imageSiz;
++            const uint32_t bgRowBytes = (uint32_t(bg.imageW >> 2) << lineSiz) >> 1;
++            const uint16_t bgLine = uint16_t((bgRowBytes + 7) >> 3);
+             const uint16_t dsdx = 4 << 10;
+             const uint16_t dsdy = 4 << 8;
+             const uint16_t lrSubstract = 4;
+@@ -478,23 +485,30 @@ namespace RT64 {
+                 }
+             }
+ 
+-            const uint32_t Division = (bg.imageFmt == G_IM_FMT_CI) ? 2 : 1;
+-            const uint16_t sliceH = uint16_t(bg.tmemH / Division);
++            // Draw the image in horizontal slices of whole rows that fit in TMEM. tmemH (u10.2) as computed by
++            // guS2DInitBg already accounts for CI images only having the lower half of TMEM available, so it must not
++            // be halved again (that produced fractional 2.5-row slices with gaps). Clamp it to what actually fits.
++            const uint32_t tmemWords = (bg.imageFmt == G_IM_FMT_CI) ? (RDP_TMEM_WORDS / 2) : RDP_TMEM_WORDS;
++            const uint32_t maxRows = (bgLine > 0) ? (tmemWords / bgLine) : 0;
++            uint32_t sliceRows = bg.tmemH >> 2;
++            if ((sliceRows == 0) || (sliceRows > maxRows)) {
++                sliceRows = maxRows;
++            }
+ 
+-            // Divide-by-zero guard: a TMEM height below one line can't be drawn.
+-            if (sliceH < lrSubstract) {
++            // Guard: an image row that doesn't fit in TMEM can't be drawn.
++            if (sliceRows == 0) {
+                 state->endSpriteCommand();
+                 return;
+             }
+ 
+-            const uint16_t bgRectCount = bg.imageH / sliceH; // TODO: Check for remaining pixels for the last Texrect.
+-            bgRectLrt = sliceH - lrSubstract;
+-            rdp->setTileSize(G_TX_RENDERTILE, 0, 0, bgRectLrs, bgRectLrt);
+-
+-            for (uint16_t r = 0; r < bgRectCount; r++) {
+-                const uint16_t bgRectUlt = r * (bg.tmemH / Division);
+-                rdp->loadTile(G_TX_LOADTILE, 0, bgRectUlt, bgRectLrs, bgRectUlt + bgRectLrt);
+-                rdp->drawTexRect(bg.frameX, bg.frameY + bgRectUlt, bg.frameX + bg.frameW - lrSubstract, bg.frameY + bgRectUlt + bgRectLrt, G_TX_RENDERTILE, 0, 0, dsdx, dsdy, false);
++            const uint32_t imageRows = bg.imageH >> 2;
++            for (uint32_t row = 0; row < imageRows; row += sliceRows) {
++                const uint32_t rows = std::min(sliceRows, imageRows - row);
++                const uint16_t ult = uint16_t(row << 2);
++                const uint16_t lrt = uint16_t((row + rows - 1) << 2);
++                rdp->setTileSize(G_TX_RENDERTILE, 0, 0, bgRectLrs, uint16_t((rows - 1) << 2));
++                rdp->loadTile(G_TX_LOADTILE, 0, ult, bgRectLrs, lrt);
++                rdp->drawTexRect(bg.frameX, bg.frameY + ult, bg.frameX + bg.frameW - lrSubstract, bg.frameY + lrt, G_TX_RENDERTILE, 0, 0, dsdx, dsdy, false);
+             }
+ 
+             state->endSpriteCommand();
+-- 
+2.47.3
+
+
+From 2c8449fe24da34becb9485a94e746bbaeda5aa55 Mon Sep 17 00:00:00 2001
+From: n64recomp-shaders <n64recomp-shaders@localhost>
+Date: Sun, 18 Oct 2026 03:40:19 -0400
+Subject: [PATCH 2/2] Widescreen borders: pillarbox border canvas renderer + C
+ API
+
+WidescreenBorders draws an RGBA canvas (side + game + side columns, center
+transparent) around the game image when the window is wider than the game
+(Original aspect ratio). Reuses VIRenderer (viewport/scissor/gamma overrides),
+so no new shaders. Shader scope: GameOnly (default; borders drawn unprocessed)
+or GameAndBorders (canvas + game composed at the game's internal row
+resolution, then the post-process preset runs on the composite).
+C API: rt64_widescreen_{supported,set_enabled,is_enabled,set_canvas,
+set_shader_scope,get_shader_scope,set_filter}. New files are MIT.
+---
+ CMakeLists.txt                         |   2 +
+ src/hle/rt64_application.cpp           |   3 +
+ src/hle/rt64_application.h             |   2 +
+ src/hle/rt64_present_queue.cpp         |  98 ++++++++++++-
+ src/hle/rt64_present_queue.h           |   2 +
+ src/render/rt64_vi_renderer.cpp        |   7 +-
+ src/render/rt64_vi_renderer.h          |   9 ++
+ src/render/rt64_widescreen_api.cpp     |  50 +++++++
+ src/render/rt64_widescreen_api.h       |  52 +++++++
+ src/render/rt64_widescreen_borders.cpp | 187 +++++++++++++++++++++++++
+ src/render/rt64_widescreen_borders.h   |  92 ++++++++++++
+ 11 files changed, 497 insertions(+), 7 deletions(-)
+ create mode 100644 src/render/rt64_widescreen_api.cpp
+ create mode 100644 src/render/rt64_widescreen_api.h
+ create mode 100644 src/render/rt64_widescreen_borders.cpp
+ create mode 100644 src/render/rt64_widescreen_borders.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0caba69..579cc71 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -427,6 +427,8 @@ set (SOURCES
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_upscaler.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_vertex_processor.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_vi_renderer.cpp"
++    "${PROJECT_SOURCE_DIR}/src/render/rt64_widescreen_borders.cpp"
++    "${PROJECT_SOURCE_DIR}/src/render/rt64_widescreen_api.cpp"
+ 
+     "${PROJECT_SOURCE_DIR}/src/preset/rt64_preset.cpp"
+     "${PROJECT_SOURCE_DIR}/src/preset/rt64_preset_draw_call.cpp"
+diff --git a/src/hle/rt64_application.cpp b/src/hle/rt64_application.cpp
+index 2324569..37ee00f 100644
+--- a/src/hle/rt64_application.cpp
++++ b/src/hle/rt64_application.cpp
+@@ -356,6 +356,8 @@ namespace RT64 {
+         postProcess = std::make_unique<PostProcess>(renderInterface.get(), device.get());
+         presentExt.postProcess = postProcess.get();
+ #   endif
++        widescreenBorders = std::make_unique<WidescreenBorders>();
++        presentExt.widescreenBorders = widescreenBorders.get();
+         presentQueue->setup(presentExt);
+ 
+         // Configure the state to use all the created components.
+@@ -606,6 +608,7 @@ namespace RT64 {
+         state.reset();
+         workloadQueue.reset();
+         presentQueue.reset();
++        widescreenBorders.reset();
+ #   if RT64_POSTPROCESS
+         postProcess.reset();
+ #   endif
+diff --git a/src/hle/rt64_application.h b/src/hle/rt64_application.h
+index dbf67e2..ce7e127 100644
+--- a/src/hle/rt64_application.h
++++ b/src/hle/rt64_application.h
+@@ -139,6 +139,8 @@ namespace RT64 {
+         // [magical-tetris shaders] Runtime slang presets; see postfx/rt64_postprocess_api.h for the C API.
+         std::unique_ptr<PostProcess> postProcess;
+ #   endif
++        // [magical-tetris widescreen] Pillarbox border canvas; see render/rt64_widescreen_api.h.
++        std::unique_ptr<WidescreenBorders> widescreenBorders;
+         std::unique_ptr<SharedQueueResources> sharedQueueResources;
+         std::unique_ptr<RenderInterface> renderInterface;
+         std::atomic<bool> debuggerPaused;
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index 3951cf6..0c32566 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -337,10 +337,89 @@ namespace RT64 {
+                     }
+                 }
+                 
++                // [magical-tetris widescreen] Pillarbox border art around the game image.
++                WidescreenBorders::Plan bordersPlan;
++                if ((ext.widescreenBorders != nullptr) && (renderParams.texture != nullptr) && (renderParams.vi != nullptr)) {
++                    ext.widescreenBorders->beginFrame(ext.device, commandList);
++                    bordersPlan = ext.widescreenBorders->plan(renderParams);
++                }
++
++                bool presentedComposite = false;
+ #           if RT64_POSTPROCESS
++                // [magical-tetris widescreen] "Game and borders" shader scope: compose both into one image at
++                // the game's internal resolution, run the preset on it, then present the result.
++                if (bordersPlan.active && (ext.postProcess != nullptr) && ext.postProcess->isEnabled() &&
++                    (ext.widescreenBorders->getShaderScope() == WidescreenBorders::ShaderScope::GameAndBorders))
++                {
++                    RenderViewport gameViewport;
++                    RenderRect gameScissor;
++                    hlslpp::float2 gameRegion;
++                    VIRenderer::getViewportAndScissor(ext.swapChain, *renderParams.vi, renderParams.resolutionScale, renderParams.downsamplingScale, gameViewport, gameScissor, gameRegion);
++
++                    // Window rectangle covered by the borders + game, and its scale to the game's internal rows.
++                    const RenderRect &r = bordersPlan.canvasScissor;
++                    const float k = std::max(1.0f, float(gameRegion.y)) / std::max(1.0f, float(gameViewport.height));
++                    const uint32_t composeW = std::max<uint32_t>(1, uint32_t(std::lround(float(r.right - r.left) * k)));
++                    const uint32_t composeH = std::max<uint32_t>(1, uint32_t(std::lround(float(r.bottom - r.top) * k)));
++                    if (ext.widescreenBorders->ensureComposeTarget(ext.device, composeW, composeH)) {
++                        WidescreenBorders *b = ext.widescreenBorders;
++                        auto toCompose = [&](const RenderViewport &v) {
++                            return RenderViewport((v.x - float(r.left)) * k, (v.y - float(r.top)) * k, v.width * k, v.height * k);
++                        };
++
++                        const RenderRect fullCompose(0, 0, int32_t(composeW), int32_t(composeH));
++                        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(b->composeTexture(), RenderTextureLayout::COLOR_WRITE));
++                        commandList->setFramebuffer(b->composeFramebuffer());
++                        commandList->clearColor();
++                        b->drawCanvas(renderParams, toCompose(bordersPlan.canvasViewport), fullCompose);
++
++                        VIRenderer::RenderParams composedGame = renderParams;
++                        const RenderViewport gameInCompose = toCompose(gameViewport);
++                        composedGame.useViewportOverride = true;
++                        composedGame.viewportOverride = gameInCompose;
++                        composedGame.scissorOverride = RenderRect(
++                            std::max<int32_t>(0, int32_t(std::lround((float(gameScissor.left) - float(r.left)) * k))),
++                            std::max<int32_t>(0, int32_t(std::lround((float(gameScissor.top) - float(r.top)) * k))),
++                            std::min<int32_t>(int32_t(composeW), int32_t(std::lround((float(gameScissor.right) - float(r.left)) * k))),
++                            std::min<int32_t>(int32_t(composeH), int32_t(std::lround((float(gameScissor.bottom) - float(r.top)) * k))));
++                        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(renderParams.texture, RenderTextureLayout::SHADER_READ));
++                        b->composedGameRenderer.render(composedGame);
++                        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(b->composeTexture(), RenderTextureLayout::SHADER_READ));
++
++                        VIRenderer::RenderParams finalParams = renderParams;
++                        finalParams.texture = b->composeTexture();
++                        finalParams.textureFormat = RenderFormat::B8G8R8A8_UNORM;
++                        finalParams.textureWidth = composeW;
++                        finalParams.textureHeight = composeH;
++                        finalParams.textureIsVideoRegion = true;
++                        finalParams.gammaOverride = 1.0f; // Gamma was applied while composing.
++                        finalParams.useViewportOverride = true;
++                        finalParams.viewportOverride = RenderViewport(float(r.left), float(r.top), float(r.right - r.left), float(r.bottom - r.top));
++                        finalParams.scissorOverride = r;
++
++                        PostProcessOutput ppOutput;
++                        if (ext.postProcess->process(commandList, b->composeTexture(), RenderFormat::B8G8R8A8_UNORM, composeW, composeH,
++                            float(composeW), float(composeH), float(r.right - r.left), float(r.bottom - r.top), ppOutput))
++                        {
++                            finalParams.texture = ppOutput.texture;
++                            finalParams.textureWidth = ppOutput.width;
++                            finalParams.textureHeight = ppOutput.height;
++                            if (ppOutput.viewportSized) {
++                                finalParams.filtering = UserConfiguration::Filtering::Nearest;
++                            }
++                        }
++
++                        commandList->setFramebuffer(swapChainFramebuffer);
++                        commandList->clearColor();
++                        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(finalParams.texture, RenderTextureLayout::SHADER_READ));
++                        b->finalRenderer.render(finalParams);
++                        presentedComposite = true;
++                    }
++                }
++
+                 // [magical-tetris shaders] Run the slang preset chain on the game image before the VI
+                 // renderer scales it to the window. Always called so preset changes get picked up.
+-                if ((ext.postProcess != nullptr) && (renderParams.texture != nullptr) && (renderParams.vi != nullptr)) {
++                if (!presentedComposite && (ext.postProcess != nullptr) && (renderParams.texture != nullptr) && (renderParams.vi != nullptr)) {
+                     RenderViewport ppViewport;
+                     RenderRect ppScissor;
+                     hlslpp::float2 ppRegion;
+@@ -361,12 +440,19 @@ namespace RT64 {
+                 }
+ #           endif
+ 
+-                commandList->setFramebuffer(swapChainFramebuffer);
+-                commandList->clearColor();
++                if (!presentedComposite) {
++                    commandList->setFramebuffer(swapChainFramebuffer);
++                    commandList->clearColor();
+ 
+-                if (renderParams.texture != nullptr) {
+-                    commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(renderParams.texture, RenderTextureLayout::SHADER_READ));
+-                    viRenderer->render(renderParams);
++                    // [magical-tetris widescreen] Borders first (unprocessed), then the game on top.
++                    if (bordersPlan.active) {
++                        ext.widescreenBorders->drawCanvas(renderParams, bordersPlan.canvasViewport, bordersPlan.canvasScissor);
++                    }
++
++                    if (renderParams.texture != nullptr) {
++                        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(renderParams.texture, RenderTextureLayout::SHADER_READ));
++                        viRenderer->render(renderParams);
++                    }
+                 }
+ 
+                 RenderHookDraw *drawHook = GetRenderHookDraw();
+diff --git a/src/hle/rt64_present_queue.h b/src/hle/rt64_present_queue.h
+index bed2ffb..c5c6746 100644
+--- a/src/hle/rt64_present_queue.h
++++ b/src/hle/rt64_present_queue.h
+@@ -7,6 +7,7 @@
+ #include "common/rt64_profiling_timer.h"
+ #include "gui/rt64_inspector.h"
+ #include "render/rt64_vi_renderer.h"
++#include "render/rt64_widescreen_borders.h"
+ #if RT64_POSTPROCESS
+ #   include "postfx/rt64_postprocess.h"
+ #endif
+@@ -33,6 +34,7 @@ namespace RT64 {
+ #       if RT64_POSTPROCESS
+             PostProcess *postProcess = nullptr;
+ #       endif
++            WidescreenBorders *widescreenBorders = nullptr; // [magical-tetris widescreen]
+         };
+ 
+         External ext;
+diff --git a/src/render/rt64_vi_renderer.cpp b/src/render/rt64_vi_renderer.cpp
+index 4c18abb..226414a 100644
+--- a/src/render/rt64_vi_renderer.cpp
++++ b/src/render/rt64_vi_renderer.cpp
+@@ -71,13 +71,18 @@ namespace RT64 {
+         RenderRect scissor;
+         hlslpp::float2 fbHdRegion;
+         getViewportAndScissor(p.swapChain, *p.vi, p.resolutionScale, p.downsamplingScale, viewport, scissor, fbHdRegion);
++        if (p.useViewportOverride) {
++            viewport = p.viewportOverride;
++            scissor = p.scissorOverride;
++        }
++
+         p.commandList->setViewports(viewport);
+         p.commandList->setScissors(scissor);
+ 
+         interop::VideoInterfaceCB pushConstants;
+         pushConstants.videoResolution = p.textureIsVideoRegion ? hlslpp::float2(float(p.textureWidth), float(p.textureHeight)) : fbHdRegion;
+         pushConstants.textureResolution = { float(p.textureWidth), float(p.textureHeight) };
+-        pushConstants.gamma = p.vi->gamma();
++        pushConstants.gamma = (p.gammaOverride > 0.0f) ? p.gammaOverride : p.vi->gamma();
+ 
+         p.commandList->setPipeline(shader->pipeline.get());
+         p.commandList->setGraphicsPipelineLayout(shader->pipelineLayout.get());
+diff --git a/src/render/rt64_vi_renderer.h b/src/render/rt64_vi_renderer.h
+index 8b98fac..b749804 100644
+--- a/src/render/rt64_vi_renderer.h
++++ b/src/render/rt64_vi_renderer.h
+@@ -32,6 +32,15 @@ namespace RT64 {
+             // [magical-tetris shaders] When set, `texture` (textureWidth x textureHeight) already holds
+             // exactly the VI region (the post-processing output), so all of it maps to the viewport.
+             bool textureIsVideoRegion = false;
++
++            // [magical-tetris widescreen] Draw into this viewport/scissor instead of the one derived from the
++            // VI and the swap chain (used for the border canvas and for offscreen composition).
++            bool useViewportOverride = false;
++            RenderViewport viewportOverride;
++            RenderRect scissorOverride;
++
++            // [magical-tetris widescreen] Gamma exponent to use instead of the VI's (> 0 to apply).
++            float gammaOverride = 0.0f;
+         };
+ 
+         VIRenderer();
+diff --git a/src/render/rt64_widescreen_api.cpp b/src/render/rt64_widescreen_api.cpp
+new file mode 100644
+index 0000000..55541d0
+--- /dev/null
++++ b/src/render/rt64_widescreen_api.cpp
+@@ -0,0 +1,50 @@
++//
++// RT64 widescreen borders: C API.
++// SPDX-License-Identifier: MIT
++//
++
++#include "rt64_widescreen_api.h"
++
++#include "hle/rt64_application.h"
++
++namespace {
++    RT64::WidescreenBorders *getBorders(void *app) {
++        return (app != nullptr) ? static_cast<RT64::Application *>(app)->widescreenBorders.get() : nullptr;
++    }
++}
++
++extern "C" {
++    int rt64_widescreen_supported(void) {
++        return 1;
++    }
++
++    void rt64_widescreen_set_enabled(void *app, int enabled) {
++        if (RT64::WidescreenBorders *b = getBorders(app)) b->setEnabled(enabled != 0);
++    }
++
++    int rt64_widescreen_is_enabled(void *app) {
++        RT64::WidescreenBorders *b = getBorders(app);
++        return ((b != nullptr) && b->isEnabled()) ? 1 : 0;
++    }
++
++    int rt64_widescreen_set_canvas(void *app, const unsigned char *rgba, int width, int height, int game_width) {
++        RT64::WidescreenBorders *b = getBorders(app);
++        if ((b == nullptr) || (width < 0) || (height < 0) || (game_width < 0)) return 0;
++        return b->setCanvas(rgba, uint32_t(width), uint32_t(height), uint32_t(game_width)) ? 1 : 0;
++    }
++
++    void rt64_widescreen_set_shader_scope(void *app, int scope) {
++        if (RT64::WidescreenBorders *b = getBorders(app)) {
++            b->setShaderScope((scope == RT64_WIDESCREEN_SHADERS_GAME_AND_BORDERS) ? RT64::WidescreenBorders::ShaderScope::GameAndBorders : RT64::WidescreenBorders::ShaderScope::GameOnly);
++        }
++    }
++
++    int rt64_widescreen_get_shader_scope(void *app) {
++        RT64::WidescreenBorders *b = getBorders(app);
++        return ((b != nullptr) && (b->getShaderScope() == RT64::WidescreenBorders::ShaderScope::GameAndBorders)) ? RT64_WIDESCREEN_SHADERS_GAME_AND_BORDERS : RT64_WIDESCREEN_SHADERS_GAME_ONLY;
++    }
++
++    void rt64_widescreen_set_filter(void *app, int linear) {
++        if (RT64::WidescreenBorders *b = getBorders(app)) b->setLinearFiltering(linear != 0);
++    }
++}
+diff --git a/src/render/rt64_widescreen_api.h b/src/render/rt64_widescreen_api.h
+new file mode 100644
+index 0000000..a5f2a4b
+--- /dev/null
++++ b/src/render/rt64_widescreen_api.h
+@@ -0,0 +1,52 @@
++/*
++ * RT64 widescreen borders: C API.
++ * SPDX-License-Identifier: MIT
++ *
++ * `app` is the RT64::Application* the game created. Safe to call from any thread while rendering.
++ *
++ *   rt64_widescreen_set_canvas(app, rgba, 480, 240, 320);   // 80 + 320 + 80 columns, center = game
++ *   rt64_widescreen_set_enabled(app, 1);
++ *   rt64_widescreen_set_shader_scope(app, RT64_WIDESCREEN_SHADERS_GAME_ONLY);
++ *
++ * Borders show wherever the window is wider than the game image (use the "Original" aspect ratio).
++ */
++
++#ifndef RT64_WIDESCREEN_API_H
++#define RT64_WIDESCREEN_API_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#if defined(_WIN32)
++#   define RT64_WIDESCREEN_API
++#else
++#   define RT64_WIDESCREEN_API __attribute__((visibility("default")))
++#endif
++
++#define RT64_WIDESCREEN_SHADERS_GAME_ONLY 0
++#define RT64_WIDESCREEN_SHADERS_GAME_AND_BORDERS 1
++
++/* 1 if this RT64 build can draw widescreen borders. */
++RT64_WIDESCREEN_API int rt64_widescreen_supported(void);
++
++RT64_WIDESCREEN_API void rt64_widescreen_set_enabled(void *app, int enabled);
++RT64_WIDESCREEN_API int rt64_widescreen_is_enabled(void *app);
++
++/* RGBA8 (straight alpha, row-major) canvas; its center game_width columns line up with the game image.
++ * The pixels are copied; the new canvas shows from the next frame. rgba == NULL clears it.
++ * Returns 1 on success, 0 for invalid sizes. */
++RT64_WIDESCREEN_API int rt64_widescreen_set_canvas(void *app, const unsigned char *rgba, int width, int height, int game_width);
++
++/* Which image the post-processing preset applies to (default: game only). */
++RT64_WIDESCREEN_API void rt64_widescreen_set_shader_scope(void *app, int scope);
++RT64_WIDESCREEN_API int rt64_widescreen_get_shader_scope(void *app);
++
++/* 0 = nearest (default, crisp pixels), 1 = linear. */
++RT64_WIDESCREEN_API void rt64_widescreen_set_filter(void *app, int linear);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/render/rt64_widescreen_borders.cpp b/src/render/rt64_widescreen_borders.cpp
+new file mode 100644
+index 0000000..30fa446
+--- /dev/null
++++ b/src/render/rt64_widescreen_borders.cpp
+@@ -0,0 +1,187 @@
++//
++// RT64 widescreen borders.
++// SPDX-License-Identifier: MIT
++//
++
++#include "rt64_widescreen_borders.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++
++namespace RT64 {
++    static const uint32_t UploadPitchAlignment = 256;
++
++    WidescreenBorders::WidescreenBorders() { }
++
++    WidescreenBorders::~WidescreenBorders() { }
++
++    void WidescreenBorders::setEnabled(bool enabled) {
++        std::lock_guard<std::mutex> lock(mutex);
++        this->enabled = enabled;
++    }
++
++    bool WidescreenBorders::isEnabled() const {
++        std::lock_guard<std::mutex> lock(mutex);
++        return enabled;
++    }
++
++    bool WidescreenBorders::setCanvas(const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t gameWidth) {
++        const bool clear = (rgba == nullptr) || (width == 0) || (height == 0);
++        if (!clear && ((gameWidth == 0) || (gameWidth > width) || (width > 8192) || (height > 8192))) {
++            return false;
++        }
++
++        std::lock_guard<std::mutex> lock(mutex);
++        if (clear) {
++            pendingPixels.clear();
++            pendingWidth = pendingHeight = pendingGameWidth = 0;
++        }
++        else {
++            pendingPixels.assign(rgba, rgba + size_t(width) * height * 4);
++            pendingWidth = width;
++            pendingHeight = height;
++            pendingGameWidth = gameWidth;
++        }
++
++        pendingCanvas = true;
++        return true;
++    }
++
++    void WidescreenBorders::setShaderScope(ShaderScope scope) {
++        std::lock_guard<std::mutex> lock(mutex);
++        this->scope = scope;
++    }
++
++    WidescreenBorders::ShaderScope WidescreenBorders::getShaderScope() const {
++        std::lock_guard<std::mutex> lock(mutex);
++        return scope;
++    }
++
++    void WidescreenBorders::setLinearFiltering(bool linear) {
++        std::lock_guard<std::mutex> lock(mutex);
++        this->linear = linear;
++    }
++
++    void WidescreenBorders::beginFrame(RenderDevice *device, RenderCommandList *commandList) {
++        std::vector<uint8_t> pixels;
++        uint32_t w = 0, h = 0, gw = 0;
++        bool upload = false;
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            frameEnabled = enabled;
++            frameLinear = linear;
++            if (pendingCanvas) {
++                pixels.swap(pendingPixels);
++                w = pendingWidth;
++                h = pendingHeight;
++                gw = pendingGameWidth;
++                pendingCanvas = false;
++                upload = true;
++            }
++        }
++
++        if (!upload) {
++            // The previous frame's copy has completed (the present thread waits for the GPU every frame).
++            canvasUpload.reset();
++            return;
++        }
++
++        // Safe to release the old texture: the GPU finished the previous frame.
++        canvas.reset();
++        canvasUpload.reset();
++        canvasW = canvasH = canvasGameW = 0;
++        if (pixels.empty()) {
++            return;
++        }
++
++        const uint32_t rowPitch = w * 4;
++        const uint32_t alignedRowPitch = (rowPitch + UploadPitchAlignment - 1) / UploadPitchAlignment * UploadPitchAlignment;
++        canvas = device->createTexture(RenderTextureDesc::Texture2D(w, h, 1, RenderFormat::R8G8B8A8_UNORM));
++        canvasUpload = device->createBuffer(RenderBufferDesc::UploadBuffer(uint64_t(alignedRowPitch) * h));
++        uint8_t *dst = (canvasUpload != nullptr) ? reinterpret_cast<uint8_t *>(canvasUpload->map()) : nullptr;
++        if ((canvas == nullptr) || (dst == nullptr)) {
++            canvas.reset();
++            canvasUpload.reset();
++            return;
++        }
++
++        for (uint32_t y = 0; y < h; y++) {
++            memcpy(dst + size_t(y) * alignedRowPitch, pixels.data() + size_t(y) * rowPitch, rowPitch);
++        }
++
++        canvasUpload->unmap();
++        commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(canvas.get(), RenderTextureLayout::COPY_DEST));
++        commandList->copyTextureRegion(RenderTextureCopyLocation::Subresource(canvas.get()),
++            RenderTextureCopyLocation::PlacedFootprint(canvasUpload.get(), RenderFormat::R8G8B8A8_UNORM, w, h, 1, alignedRowPitch / 4));
++        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(canvas.get(), RenderTextureLayout::SHADER_READ));
++        canvasW = w;
++        canvasH = h;
++        canvasGameW = gw;
++    }
++
++    WidescreenBorders::Plan WidescreenBorders::plan(const VIRenderer::RenderParams &game) const {
++        Plan p;
++        if (!frameEnabled || (canvas == nullptr) || (game.swapChain == nullptr) || (game.vi == nullptr)) {
++            return p;
++        }
++
++        hlslpp::float2 fbHdRegion;
++        VIRenderer::getViewportAndScissor(game.swapChain, *game.vi, game.resolutionScale, game.downsamplingScale, p.gameViewport, p.gameScissor, fbHdRegion);
++        if ((p.gameViewport.width <= 0.0f) || (p.gameViewport.height <= 0.0f)) {
++            return p;
++        }
++
++        // Canvas rows map onto the game viewport's rows and its center gameWidth columns onto the viewport's width.
++        const float sx = p.gameViewport.width / float(canvasGameW);
++        const float sy = p.gameViewport.height / float(canvasH);
++        const float w = float(canvasW) * sx;
++        const float cx = p.gameViewport.x + p.gameViewport.width * 0.5f;
++        p.canvasViewport = RenderViewport(cx - w * 0.5f, p.gameViewport.y, w, float(canvasH) * sy);
++
++        const int32_t windowW = int32_t(game.swapChain->getWidth());
++        const int32_t windowH = int32_t(game.swapChain->getHeight());
++        p.canvasScissor = RenderRect(
++            std::max<int32_t>(0, int32_t(std::floor(p.canvasViewport.x))),
++            std::max<int32_t>(0, int32_t(std::floor(p.canvasViewport.y))),
++            std::min<int32_t>(windowW, int32_t(std::ceil(p.canvasViewport.x + p.canvasViewport.width))),
++            std::min<int32_t>(windowH, int32_t(std::ceil(p.canvasViewport.y + p.canvasViewport.height))));
++
++        // Nothing to show when the window isn't wider than the game.
++        p.active = (p.canvasScissor.left < int32_t(std::floor(p.gameViewport.x))) || (p.canvasScissor.right > int32_t(std::ceil(p.gameViewport.x + p.gameViewport.width)));
++        return p;
++    }
++
++    void WidescreenBorders::drawCanvas(const VIRenderer::RenderParams &game, const RenderViewport &viewport, const RenderRect &scissor) {
++        VIRenderer::RenderParams p = game;
++        p.texture = canvas.get();
++        p.textureFormat = RenderFormat::R8G8B8A8_UNORM;
++        p.textureWidth = canvasW;
++        p.textureHeight = canvasH;
++        p.textureIsVideoRegion = true;
++        p.filtering = frameLinear ? UserConfiguration::Filtering::Linear : UserConfiguration::Filtering::Nearest;
++        p.useViewportOverride = true;
++        p.viewportOverride = viewport;
++        p.scissorOverride = scissor;
++        canvasRenderer.render(p);
++    }
++
++    bool WidescreenBorders::ensureComposeTarget(RenderDevice *device, uint32_t width, uint32_t height) {
++        if ((compose != nullptr) && (composeW == width) && (composeH == height)) {
++            return true;
++        }
++
++        composeFb.reset();
++        compose = device->createTexture(RenderTextureDesc::ColorTarget(width, height, RenderFormat::B8G8R8A8_UNORM));
++        if (compose == nullptr) {
++            composeW = composeH = 0;
++            return false;
++        }
++
++        const RenderTexture *target = compose.get();
++        composeFb = device->createFramebuffer(RenderFramebufferDesc(&target, 1));
++        composeW = width;
++        composeH = height;
++        return composeFb != nullptr;
++    }
++};
+diff --git a/src/render/rt64_widescreen_borders.h b/src/render/rt64_widescreen_borders.h
+new file mode 100644
+index 0000000..bf4f577
+--- /dev/null
++++ b/src/render/rt64_widescreen_borders.h
+@@ -0,0 +1,92 @@
++//
++// RT64 widescreen borders: draw an app-provided RGBA canvas around the 4:3 game image (pillarbox art).
++// SPDX-License-Identifier: MIT
++//
++// The canvas is canvasWidth x canvasHeight pixels whose center gameWidth columns line up with the game
++// image; it is scaled so its height matches the game's and centered on it. Only the parts outside the
++// game are visible. Pixels are decoded by the application (e.g. from the user's ROM); RT64 never ships
++// any art.
++//
++// Shader scope (when a post-processing preset is active):
++// - GameOnly (default): the preset runs on the game image only; the borders are drawn unprocessed.
++// - GameAndBorders: game + borders are composed into one image first and the preset runs on all of it.
++//
++// Thread model: the setters may be called from any thread. The present thread uploads a new canvas at
++// the start of its next frame.
++//
++
++#pragma once
++
++#include <memory>
++#include <mutex>
++#include <vector>
++
++#include "rhi/rt64_render_interface.h"
++#include "rt64_vi_renderer.h"
++
++namespace RT64 {
++    struct WidescreenBorders {
++        enum class ShaderScope {
++            GameOnly = 0,
++            GameAndBorders = 1
++        };
++
++        // Window-space layout for one frame.
++        struct Plan {
++            bool active = false;
++            RenderViewport gameViewport;
++            RenderRect gameScissor;
++            RenderViewport canvasViewport; // where the whole canvas lands (may extend past the window)
++            RenderRect canvasScissor;      // canvas clipped to the window
++        };
++
++        WidescreenBorders();
++        ~WidescreenBorders();
++
++        // Any thread.
++        void setEnabled(bool enabled);
++        bool isEnabled() const;
++        // Copies the pixels. rgba == nullptr (or a zero size) clears the canvas.
++        bool setCanvas(const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t gameWidth);
++        void setShaderScope(ShaderScope scope);
++        ShaderScope getShaderScope() const;
++        void setLinearFiltering(bool linear);
++
++        // Present thread.
++        void beginFrame(RenderDevice *device, RenderCommandList *commandList);
++        Plan plan(const VIRenderer::RenderParams &game) const;
++        // Draws the canvas with the VI shader into the current framebuffer.
++        void drawCanvas(const VIRenderer::RenderParams &game, const RenderViewport &viewport, const RenderRect &scissor);
++        // Offscreen target for the GameAndBorders scope (B8G8R8A8, the format of the VI pipelines).
++        bool ensureComposeTarget(RenderDevice *device, uint32_t width, uint32_t height);
++
++        RenderTexture *composeTexture() const { return compose.get(); }
++        RenderFramebuffer *composeFramebuffer() const { return composeFb.get(); }
++        uint32_t composeWidth() const { return composeW; }
++        uint32_t composeHeight() const { return composeH; }
++
++        // Separate VI renderers so each draw in a frame has its own descriptor set.
++        VIRenderer canvasRenderer;
++        VIRenderer composedGameRenderer;
++        VIRenderer finalRenderer;
++
++    private:
++        mutable std::mutex mutex;
++        bool enabled = false;
++        ShaderScope scope = ShaderScope::GameOnly;
++        bool linear = false;
++        bool pendingCanvas = false;
++        std::vector<uint8_t> pendingPixels;
++        uint32_t pendingWidth = 0, pendingHeight = 0, pendingGameWidth = 0;
++
++        // Present thread only.
++        std::unique_ptr<RenderTexture> canvas;
++        std::unique_ptr<RenderBuffer> canvasUpload;
++        uint32_t canvasW = 0, canvasH = 0, canvasGameW = 0;
++        bool frameEnabled = false;
++        bool frameLinear = false;
++        std::unique_ptr<RenderTexture> compose;
++        std::unique_ptr<RenderFramebuffer> composeFb;
++        uint32_t composeW = 0, composeH = 0;
++    };
++};
+-- 
+2.47.3
+

@@ -1,0 +1,67 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fc06930..4ec853c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -40,7 +40,12 @@ function(preprocess INFILE OUTFILE OPTIONS)
+ endfunction()
+ 
+ if (WIN32)
+-    set (DXC "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
++    if (CMAKE_HOST_WIN32)
++        set (DXC "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
++    else()
++        # [n64recomp-cross] Cross-compiling to Windows from Linux: run the Linux DXC build (it can emit DXIL + SPIR-V).
++        set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-linux")
++    endif()
+     add_compile_definitions(NOMINMAX)
+ 
+     # Dependencies that must be next to the DLL.
+@@ -463,12 +468,18 @@ if (WIN32)
+         "${PROJECT_SOURCE_DIR}/src/contrib/imgui/backends/imgui_impl_dx12.cpp"
+         "${PROJECT_SOURCE_DIR}/src/contrib/imgui/backends/imgui_impl_win32.cpp"
+     )
++    if (MINGW)
++        # [n64recomp-cross] mingw import-lib names; delayimp is MSVC-only.
++        target_link_libraries(rt64 d3d12 dxgi shcore d3dcompiler_47 dwmapi imm32 version
++            ${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64/dxcompiler.lib)
++    else()
+     target_link_libraries(rt64
+         delayimp.lib
+         D3D12
+         DXGI
+         Shcore.lib
+         ${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64/dxcompiler.lib)
++    endif()
+ 
+     target_include_directories(rt64 PRIVATE ${zstd_SOURCE_DIR}/lib)
+ endif()
+diff --git a/src/common/rt64_tmem_hasher.h b/src/common/rt64_tmem_hasher.h
+index 9a332ab..8ead496 100644
+--- a/src/common/rt64_tmem_hasher.h
++++ b/src/common/rt64_tmem_hasher.h
+@@ -23,7 +23,7 @@ static unsigned bitScanForward64(uint64_t val) {
+         __assume(0);
+     }
+ #endif
+-#elif defined(__GNUC__) && (__GNUC__ >= 4) && defined(__LP64__)
++#elif defined(__GNUC__) && (__GNUC__ >= 4) && (defined(__LP64__) || defined(_WIN64)) // [n64recomp-cross] mingw is LLP64
+     return (unsigned)__builtin_ctzll(val);
+ #elif defined(__ICCARM__)
+     return (unsigned)__builtin_ctzll(val);
+diff --git a/src/tools/file_to_c/CMakeLists.txt b/src/tools/file_to_c/CMakeLists.txt
+index 22ee3eb..22077c6 100644
+--- a/src/tools/file_to_c/CMakeLists.txt
++++ b/src/tools/file_to_c/CMakeLists.txt
+@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.20)
+ project(file_to_c)
+ set(CMAKE_CXX_STANDARD 17)
+ 
++if (CMAKE_CROSSCOMPILING AND DEFINED FILE_TO_C_HOST_EXECUTABLE)
++    # [n64recomp-cross] Use a natively built file_to_c when cross-compiling.
++    add_executable(file_to_c IMPORTED GLOBAL)
++    set_target_properties(file_to_c PROPERTIES IMPORTED_LOCATION "${FILE_TO_C_HOST_EXECUTABLE}")
++    return()
++endif()
+ add_executable(file_to_c "file_to_c.cpp")
+ 
+ if (APPLE)
