@@ -1,6 +1,10 @@
 # Magical Blocks
 
-An unofficial Windows PC port of an N64 puzzle game, made with [N64Recomp](https://github.com/N64Recomp/N64Recomp).
+**Game:** Magical Tetris Challenge (USA)  
+**System:** Nintendo 64 (N64)  
+**Runs on:** Windows PC
+
+An unofficial Windows PC port of the Nintendo 64 game Magical Tetris Challenge, made with [N64Recomp](https://github.com/N64Recomp/N64Recomp).
 
 **Requires your own legally dumped Magical Tetris Challenge (USA) N64 ROM.** No game files are included.
 The game is built on your own PC from your ROM the first time you start it (this takes a few seconds).
